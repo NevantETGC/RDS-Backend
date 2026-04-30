@@ -144,6 +144,37 @@ app.patch('/violation/:id/ticket', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+app.post('/dispatch/fire', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    var payload = req.body;
+    if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch(e) {} }
+    const { caller_name, region, address, issue, timestamp } = payload;
+    const detector_code = 'DISPATCH';
+    const sim_code = 'DISP';
+    const parcel_code = address || 'UNKNOWN';
+    const location = sim_code + '-' + parcel_code;
+
+    const alarmResult = await client.query(
+      `INSERT INTO fire_alarms (detector_code, sim_code, parcel_code, detector_num, region, alarm_type, fire_count, smoke_count, ladder_triggered, status, first_detected)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) RETURNING id`,
+      [detector_code, sim_code, parcel_code, 'D1', region || 'UNKNOWN', 'FIRE', 1, 0, false, 'active']
+    );
+    const alarmId = alarmResult.rows[0].id;
+
+    await client.query(
+      `INSERT INTO alarm_notifications (alarm_id, department, message) VALUES ($1,$2,$3)`,
+      [alarmId, 'fd', 'Fire reported at ' + location + ' by ' + caller_name + ' | ' + issue]
+    );
+
+    res.json({ success: true, alarm_id: alarmId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
 app.patch('/incidents/dismiss-fd', async (req, res) => {
   try {
     await pool.query('UPDATE incidents SET dismissed_fd = true WHERE dismissed_fd = false AND resolved = false');
@@ -463,7 +494,7 @@ app.post('/medical', async (req, res) => {
 app.get('/medical/pending', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM medical_alerts WHERE created_at > NOW() - INTERVAL '5 minutes' ORDER BY created_at ASC`
+      `SELECT * FROM medical_alerts WHERE seen_panel = FALSE ORDER BY created_at ASC`
     );
     res.json(result.rows);
   } catch (err) {
@@ -471,9 +502,18 @@ app.get('/medical/pending', async (req, res) => {
   }
 });
 
+
+app.patch('/medical/seen-panel', async (req, res) => {
+  try {
+    await pool.query('UPDATE medical_alerts SET seen_panel = TRUE WHERE seen_panel = FALSE');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.patch('/medical/seen', async (req, res) => {
   try {
-    await pool.query(`UPDATE medical_alerts SET seen = TRUE WHERE seen = FALSE`);
+    await pool.query(`UPDATE medical_alerts SET seen_panel = TRUE WHERE seen_panel = FALSE`);
     res.json({ status: 'ok' });
   } catch (err) {
     res.status(500).json({ error: err.message });
