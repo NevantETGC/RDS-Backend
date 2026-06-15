@@ -353,7 +353,11 @@ app.patch('/violation/:id/dismiss', async (req, res) => {
 app.post('/alarm', async (req, res) => {
   const { detector_code, sim_code, parcel_code, detector_num, region,
           alarm_type, fire_count, smoke_count, ladder_triggered,
-          first_detected, world_x, world_y } = req.body;
+          first_detected, world_x, world_y, slurl } = req.body;
+  const org = req.body.org_code || 'rfr';
+  const incidentType = req.body.incident_type || null;
+  const unitsRaw = req.body.units;
+  const units = Array.isArray(unitsRaw) ? unitsRaw.join(',') : (unitsRaw || null);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -382,26 +386,38 @@ app.post('/alarm', async (req, res) => {
         const alarmId = existing.rows[0].id;
         const location = sim_code + '-' + parcel_code;
         await client.query(
-          'INSERT INTO alarm_notifications (alarm_id, department, message) VALUES ($1,$2,$3)',
-          [alarmId, 'fd', 'LADDER ESCALATION: ' + detector_code + ' at ' + location + ' | Fire objects: ' + fire_count]
+          'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
+          [alarmId, 'fd', 'LADDER ESCALATION: ' + detector_code + ' at ' + location + ' | Fire objects: ' + fire_count, org]
         );
       }
     } else {
       alarm = await client.query(
-        "INSERT INTO fire_alarms (detector_code, sim_code, parcel_code, detector_num, region, alarm_type, fire_count, smoke_count, ladder_triggered, first_detected, last_updated, status, world_x, world_y) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),'active',$11,$12) RETURNING *",
+        "INSERT INTO fire_alarms (detector_code, sim_code, parcel_code, detector_num, region, alarm_type, fire_count, smoke_count, ladder_triggered, first_detected, last_updated, status, world_x, world_y, org_code, incident_type, units_dispatched) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),'active',$11,$12,$13,$14,$15) RETURNING *",
         [detector_code, sim_code, parcel_code, detector_num, region,
          alarm_type, fire_count || 0, smoke_count || 0, ladder_triggered || false,
-         first_detected || new Date().toISOString(), world_x || 128, world_y || 128]
+         first_detected || new Date().toISOString(), world_x || 128, world_y || 128, org, incidentType, units]
       );
       const alarmId = alarm.rows[0].id;
       const location = sim_code + '-' + parcel_code;
       await client.query(
-        'INSERT INTO alarm_notifications (alarm_id, department, message) VALUES ($1,$2,$3)',
-        [alarmId, 'fd', 'Fire alarm: ' + detector_code + ' at ' + location + ' | ' + alarm_type]
+        'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
+        [alarmId, 'fd', 'Fire alarm: ' + detector_code + ' at ' + location + ' | ' + alarm_type, org]
       );
       await client.query(
-        'INSERT INTO alarm_notifications (alarm_id, department, message) VALUES ($1,$2,$3)',
-        [alarmId, 'pd', 'Fire alarm reported at ' + location + ' (' + region + ')']
+        'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
+        [alarmId, 'pd', 'Fire alarm reported at ' + location + ' (' + region + ')', org]
+      );
+      // Auto-create a dispatch_call so the alarm persists in the dispatcher
+      // queue until a dispatcher manually clears it (FD side still auto-clears).
+      const dispSlurl = slurl || ('secondlife://' + (region||'').replace(/ /g,'%20') + '/' + (world_x||128) + '/' + (world_y||128) + '/0');
+      await client.query(
+        `INSERT INTO dispatch_calls
+           (org_code, caller_name, location, call_type, incident_type, units, notes, status, dispatcher, dispatched, alarm_id, dispatched_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,true,$9,NOW())`,
+        [org, 'Smoke Detector (' + detector_code + ')', dispSlurl, 'fire',
+         incidentType || 'Structure Fire', units || 'Engine,Ladder,Battalion',
+         'Auto-dispatched by detector ' + detector_code + ' at ' + (region||'') + '. Alarm type: ' + alarm_type + '.',
+         'AUTO (Detector)', alarmId]
       );
     }
     await client.query('COMMIT');
@@ -559,6 +575,8 @@ app.patch('/alarm-notifications/:dept/reset', async (req, res) => {
 app.get('/alarm-notifications/:dept/beeper', async (req, res) => {
   try {
     const org = req.query.org || null;
+    // Time-window based: return active alarms from the last 90 seconds so
+    // EVERY pager polling in that window fires (no shared seen-flag race).
     let query = `SELECT fa.detector_code, fa.sim_code, fa.parcel_code, fa.detector_num,
               fa.region, fa.alarm_type, fa.fire_count, fa.smoke_count,
               fa.ladder_triggered, fa.first_detected,
@@ -568,7 +586,9 @@ app.get('/alarm-notifications/:dept/beeper', async (req, res) => {
               fa.world_x || '/' || fa.world_y || '/0' AS slurl
        FROM alarm_notifications an
        JOIN fire_alarms fa ON an.alarm_id = fa.id
-       WHERE an.department = $1 AND an.beeper_seen = false`;
+       WHERE an.department = $1
+         AND fa.status = 'active'
+         AND an.created_at >= NOW() - INTERVAL '90 seconds'`;
     const params = [req.params.dept];
     if (org) { params.push(org); query += ` AND an.org_code = $${params.length}`; }
     query += ` ORDER BY an.created_at ASC LIMIT 5`;
@@ -985,6 +1005,7 @@ app.get('/map/active', async (req, res) => {
 const TIMECLOCK_KEYS = {
   'RFR-TC-2024-3430LABS': 'rfr',
   'HH-TC-2024-3430LABS':  'harmony',
+  'HK-TC-2024-3430LABS':  'hemlock',
   'WF-TC-2024-3430LABS':  'willow'
 };
 
@@ -2198,6 +2219,135 @@ app.get('/org/:org/detectors', async (req, res) => {
     res.json(r.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+
+// ============================================================
+//  CIVCORE — Civilian Registry
+// ============================================================
+
+app.post('/civcore/register', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { avatar_uuid, avatar_name, display_name, dob, gender, bio, primary_community } = p;
+    if (!avatar_uuid || !avatar_name) return res.status(400).json({ error: 'avatar_uuid and avatar_name required' });
+    const sl_photo = 'https://profile.secondlife.com/img/' + avatar_uuid + '.jpg';
+    const r = await pool.query(
+      `INSERT INTO civilians (avatar_uuid, avatar_name, display_name, dob, gender, bio, primary_community, photo_url, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW()) ON CONFLICT (avatar_uuid) DO UPDATE SET avatar_name=EXCLUDED.avatar_name, display_name=COALESCE(EXCLUDED.display_name,civilians.display_name), dob=COALESCE(EXCLUDED.dob,civilians.dob), gender=COALESCE(EXCLUDED.gender,civilians.gender), bio=COALESCE(EXCLUDED.bio,civilians.bio), primary_community=COALESCE(EXCLUDED.primary_community,civilians.primary_community), photo_url=COALESCE(civilians.photo_url,$8), updated_at=NOW() RETURNING *`,
+      [avatar_uuid, avatar_name, display_name||null, dob||null, gender||null, bio||null, primary_community||null, sl_photo]
+    );
+    res.json({ success: true, civilian: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/civcore/profile/:uuid', async (req, res) => {
+  try {
+    const uuid = req.params.uuid;
+    const [cRes, rRes, vRes] = await Promise.all([
+      pool.query('SELECT * FROM civilians WHERE avatar_uuid = $1', [uuid]),
+      pool.query('SELECT * FROM civilian_residencies WHERE avatar_uuid = $1 ORDER BY moved_in DESC', [uuid]),
+      pool.query('SELECT * FROM vehicles WHERE owner_uuid = $1 ORDER BY registered_at DESC', [uuid]),
+    ]);
+    if (!cRes.rows.length) return res.status(404).json({ error: 'Civilian not found' });
+    res.json({ civilian: cRes.rows[0], residencies: rRes.rows, vehicles: vRes.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/civcore/profile/:uuid', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { display_name, dob, gender, bio, primary_community, photo_url, photo_key } = p;
+    const r = await pool.query(
+      `UPDATE civilians SET display_name=COALESCE($1,display_name), dob=COALESCE($2,dob), gender=COALESCE($3,gender), bio=COALESCE($4,bio), primary_community=COALESCE($5,primary_community), photo_url=COALESCE($6,photo_url), photo_key=COALESCE($7,photo_key), updated_at=NOW() WHERE avatar_uuid=$8 RETURNING *`,
+      [display_name||null, dob||null, gender||null, bio||null, primary_community||null, photo_url||null, photo_key||null, req.params.uuid]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Civilian not found' });
+    res.json({ success: true, civilian: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/civcore/search', async (req, res) => {
+  try {
+    const q = req.query.q;
+    const community = req.query.community;
+    if (!q) return res.status(400).json({ error: 'Query required' });
+    let query = "SELECT c.*, cr.community_org, cr.status as residency_status FROM civilians c LEFT JOIN civilian_residencies cr ON c.avatar_uuid = cr.avatar_uuid WHERE (c.avatar_name ILIKE $1 OR c.display_name ILIKE $1)";
+    let params = ['%' + q + '%'];
+    if (community) { query += ' AND cr.community_org = $2'; params.push(community); }
+    query += ' ORDER BY c.avatar_name LIMIT 20';
+    const r = await pool.query(query, params);
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/civcore/residency', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { avatar_uuid, community_org, status } = p;
+    if (!avatar_uuid || !community_org) return res.status(400).json({ error: 'avatar_uuid and community_org required' });
+    const r = await pool.query(
+      "INSERT INTO civilian_residencies (avatar_uuid, community_org, status, moved_in) VALUES ($1,$2,$3,NOW()) ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET status=EXCLUDED.status RETURNING *",
+      [avatar_uuid, community_org, status||'active']
+    );
+    res.json({ success: true, residency: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/civcore/residency/transfer', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { avatar_uuid, from_org, to_org, keep_dual } = p;
+    if (!avatar_uuid || !from_org || !to_org) return res.status(400).json({ error: 'avatar_uuid, from_org, to_org required' });
+    if (!keep_dual) {
+      await pool.query("UPDATE civilian_residencies SET status='former', moved_out=NOW() WHERE avatar_uuid=$1 AND community_org=$2", [avatar_uuid, from_org]);
+    }
+    await pool.query("INSERT INTO civilian_residencies (avatar_uuid, community_org, status, moved_in) VALUES ($1,$2,'active',NOW()) ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET status='active', moved_out=NULL", [avatar_uuid, to_org]);
+    await pool.query('UPDATE civilians SET primary_community=$1, updated_at=NOW() WHERE avatar_uuid=$2', [to_org, avatar_uuid]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/civcore/vehicle', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { owner_uuid, make, model, color, plate, year, community_org, photo_url, photo_key } = p;
+    if (!owner_uuid) return res.status(400).json({ error: 'owner_uuid required' });
+    const r = await pool.query(
+      "INSERT INTO vehicles (owner_uuid, make, model, color, plate, year, community_org, photo_url, photo_key, registered_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) RETURNING *",
+      [owner_uuid, make||'', model||'', color||'', plate||'', year||'', community_org||'', photo_url||'', photo_key||'']
+    );
+    res.json({ success: true, vehicle: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/civcore/vehicles/:uuid', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM vehicles WHERE owner_uuid = $1 ORDER BY registered_at DESC', [req.params.uuid]);
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/civcore/vehicle/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM vehicles WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/civcore/community/:org', async (req, res) => {
+  try {
+    const r = await pool.query(
+      "SELECT c.*, cr.status as residency_status, cr.moved_in FROM civilians c JOIN civilian_residencies cr ON c.avatar_uuid = cr.avatar_uuid WHERE cr.community_org = $1 AND cr.status = 'active' ORDER BY c.avatar_name",
+      [req.params.org]
+    );
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 app.get('/org/:org/hydrants', async (req, res) => {
   try {
