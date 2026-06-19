@@ -965,14 +965,15 @@ app.get('/hydrants', async (req, res) => {
 
 app.get('/map/active', async (req, res) => {
   try {
+    const org = req.query.org || 'rfr';
     const alarms = await pool.query(`
       SELECT id, detector_code AS code, sim_code, parcel_code, region,
              alarm_type, fire_count, smoke_count, ladder_triggered,
              world_x, world_y, status, first_detected, last_updated
       FROM fire_alarms
-      WHERE status != 'cleared'
+      WHERE status != 'cleared' AND (org_code = $1 OR org_code IS NULL)
       ORDER BY last_updated DESC
-    `);
+    `, [org]);
     const hydrants = await pool.query(`
       SELECT DISTINCT ON (hydrant_name)
         id, hydrant_name AS name, sim_name, world_x, world_y,
@@ -981,12 +982,23 @@ app.get('/map/active', async (req, res) => {
       FROM incidents
       ORDER BY hydrant_name, created_at DESC
     `);
+    const detectors = await pool.query(`
+      SELECT detector_code, region, parcel_name, slurl,
+             world_x, world_y, world_z, status, org_code
+      FROM detectors
+      WHERE org_code = $1
+        AND status = 'active'
+        AND world_x IS NOT NULL
+        AND world_y IS NOT NULL
+      ORDER BY detector_code
+    `, [org]);
     res.json({
       alarms:       alarms.rows,
       hydrants:     hydrants.rows.map(h => ({
         ...h,
         sim_code: SIM_CODES[h.sim_name] || h.sim_name.charAt(0).toUpperCase()
       })),
+      detectors:    detectors.rows,
       generated_at: new Date().toISOString()
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2343,6 +2355,184 @@ app.get('/civcore/community/:org', async (req, res) => {
     const r = await pool.query(
       "SELECT c.*, cr.status as residency_status, cr.moved_in FROM civilians c JOIN civilian_residencies cr ON c.avatar_uuid = cr.avatar_uuid WHERE cr.community_org = $1 AND cr.status = 'active' ORDER BY c.avatar_name",
       [req.params.org]
+    );
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+
+// ============================================================
+//  RES SECURITY SYSTEM — Burglary & Stolen Items
+// ============================================================
+
+// POST /security/register — register a security panel
+app.post('/security/register', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { panel_uuid, owner_uuid, owner_name, community_org, location, parcel_name, region, slurl, world_x, world_y, world_z } = p;
+    if (!panel_uuid || !owner_uuid) return res.status(400).json({ error: 'panel_uuid and owner_uuid required' });
+    await pool.query(
+      `INSERT INTO security_panels (panel_uuid, owner_uuid, owner_name, community_org, location, parcel_name, region, slurl, world_x, world_y, world_z, registered_at, last_seen)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())
+       ON CONFLICT (panel_uuid) DO UPDATE SET
+         owner_name=$3, community_org=$4, location=$5, parcel_name=$6, region=$7, slurl=$8,
+         world_x=$9, world_y=$10, world_z=$11, last_seen=NOW()`,
+      [panel_uuid, owner_uuid, owner_name||'', community_org||'hemlock', location||'', parcel_name||'', region||'', slurl||'', world_x||0, world_y||0, world_z||0]
+    );
+    res.json({ success: true, panel_uuid });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /security/arm — arm or disarm panel
+app.patch('/security/arm', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { panel_uuid, armed, silent_mode } = p;
+    await pool.query(
+      'UPDATE security_panels SET armed=$1, silent_mode=COALESCE($2,silent_mode), last_seen=NOW() WHERE panel_uuid=$3',
+      [armed, silent_mode !== undefined ? silent_mode : null, panel_uuid]
+    );
+    res.json({ success: true, armed });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /alarm/burglary — trigger burglary alarm, auto-create PD incident
+app.post('/alarm/burglary', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { panel_uuid, community_org, location, parcel_name, region, slurl, world_x, world_y, trigger_type, suspect_uuid, suspect_name } = p;
+    const org = community_org || 'hemlock';
+
+    await client.query('BEGIN');
+
+    // Create PD incident automatically
+    const incResult = await client.query(
+      `INSERT INTO pd_incidents (community_org, incident_type, location, slurl, description, reporting_officer, status, created_at)
+       VALUES ($1,'Burglary Alarm',$2,$3,$4,'RES Security System','active',NOW()) RETURNING id`,
+      [org, location||parcel_name||region||'Unknown', slurl||'', 'Automatic alarm trigger at ' + (parcel_name||location||region||'Unknown')]
+    );
+    const pdIncidentId = incResult.rows[0].id;
+
+    // Create burglary incident record
+    const burgResult = await client.query(
+      `INSERT INTO burglary_incidents (community_org, panel_uuid, location, parcel_name, region, slurl, world_x, world_y, trigger_type, suspect_uuid, suspect_name, status, pd_incident_id, triggered_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'open',$12,NOW()) RETURNING id`,
+      [org, panel_uuid||'', location||'', parcel_name||'', region||'', slurl||'', world_x||0, world_y||0, trigger_type||'motion', suspect_uuid||'', suspect_name||'', pdIncidentId]
+    );
+    const burgId = burgResult.rows[0].id;
+
+    await client.query('COMMIT');
+
+    console.log('[burglary] Alarm triggered at ' + (parcel_name||location||'Unknown') + ' | PD incident #' + pdIncidentId);
+    res.json({ success: true, burglary_id: burgId, pd_incident_id: pdIncidentId });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+// GET /security/burglaries — get burglary incidents for a community
+app.get('/security/burglaries', async (req, res) => {
+  try {
+    const org = req.query.org || 'hemlock';
+    const r = await pool.query(
+      "SELECT * FROM burglary_incidents WHERE community_org=$1 ORDER BY triggered_at DESC LIMIT 50",
+      [org]
+    );
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /security/burglary/:id/resolve — mark burglary resolved
+app.patch('/security/burglary/:id/resolve', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    await pool.query(
+      "UPDATE burglary_incidents SET status='resolved', notes=COALESCE($1,notes), resolved_at=NOW() WHERE id=$2",
+      [p.notes||null, req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /security/stolen — log a stolen item
+app.post('/security/stolen', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { item_uuid, item_name, item_type, value_l, owner_uuid, owner_name, criminal_uuid, criminal_name, community_org, location, region, burglary_id } = p;
+    if (!item_uuid || !item_name) return res.status(400).json({ error: 'item_uuid and item_name required' });
+    const r = await pool.query(
+      `INSERT INTO stolen_items (item_uuid, item_name, item_type, value_l, owner_uuid, owner_name, criminal_uuid, criminal_name, community_org, location, region, status, burglary_id, stolen_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'stolen',$12,NOW()) RETURNING *`,
+      [item_uuid, item_name, item_type||'unknown', value_l||0, owner_uuid||'', owner_name||'', criminal_uuid||'', criminal_name||'', community_org||'hemlock', location||'', region||'', burglary_id||null]
+    );
+    res.json({ success: true, item: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /security/stolen/inventory/:uuid — get criminal stolen inventory
+app.get('/security/stolen/inventory/:uuid', async (req, res) => {
+  try {
+    const r = await pool.query(
+      "SELECT * FROM stolen_items WHERE criminal_uuid=$1 AND status='stolen' ORDER BY stolen_at DESC",
+      [req.params.uuid]
+    );
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /security/stolen/:id/fence — fence a stolen item at pawn shop
+app.patch('/security/stolen/:id/fence', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    await pool.query(
+      "UPDATE stolen_items SET status='fenced', fenced_at=NOW() WHERE id=$1 AND status='stolen'",
+      [req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /security/stolen/:id/recover — PD recovers stolen item
+app.patch('/security/stolen/:id/recover', async (req, res) => {
+  try {
+    await pool.query(
+      "UPDATE stolen_items SET status='recovered', recovered_at=NOW() WHERE id=$1",
+      [req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /pd/evidence — log evidence collected at crime scene
+app.post('/pd/evidence', async (req, res) => {
+  try {
+    var p = req.body;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) {} }
+    const { community_org, burglary_id, pd_incident_id, evidence_type, suspect_uuid, suspect_name, location, region, collected_by, photo_url, notes } = p;
+    const r = await pool.query(
+      `INSERT INTO evidence (community_org, burglary_id, pd_incident_id, evidence_type, suspect_uuid, suspect_name, location, region, collected_by, photo_url, notes, collected_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) RETURNING *`,
+      [community_org||'hemlock', burglary_id||null, pd_incident_id||null, evidence_type||'fingerprint', suspect_uuid||'', suspect_name||'', location||'', region||'', collected_by||'', photo_url||'', notes||'']
+    );
+    res.json({ success: true, evidence: r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /pd/evidence/:burglary_id — get evidence for a case
+app.get('/pd/evidence/:burglary_id', async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT * FROM evidence WHERE burglary_id=$1 ORDER BY collected_at DESC',
+      [req.params.burglary_id]
     );
     res.json(r.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
