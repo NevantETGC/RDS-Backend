@@ -94,9 +94,9 @@ app.post('/incident', async (req, res) => {
           incident_date, incident_time, world_x, world_y } = req.body;
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    await pool.query('BEGIN');
     const priority = avatar_name === 'UNKNOWN' ? 'investigate' : 'normal';
-    const inc = await client.query(
+    const inc = await pool.query(
       `INSERT INTO incidents
          (sim_name, hydrant_name, avatar_name, vehicle_name,
           incident_date, incident_time, priority, world_x, world_y)
@@ -106,29 +106,29 @@ app.post('/incident', async (req, res) => {
        world_x || 128, world_y || 128]
     );
     const id = inc.rows[0].id;
-    await client.query(
+    await pool.query(
       `INSERT INTO notifications (incident_id, department, message) VALUES ($1,$2,$3)`,
       [id, 'dpw', 'New hydrant down: ' + hydrant_name + ' in ' + sim_name]
     );
-    await client.query(
+    await pool.query(
       `INSERT INTO notifications (incident_id, department, message) VALUES ($1,$2,$3)`,
       [id, 'fd', 'Hydrant down: ' + hydrant_name + ' in ' + sim_name]
     );
     if (avatar_name !== 'UNKNOWN') {
-      await client.query(
+      await pool.query(
         `INSERT INTO notifications (incident_id, department, message) VALUES ($1,$2,$3)`,
         [id, 'pd', 'Citation candidate: ' + avatar_name + ' in ' + sim_name]
       );
     } else {
-      await client.query(
+      await pool.query(
         `INSERT INTO notifications (incident_id, department, message) VALUES ($1,$2,$3)`,
         [id, 'pd', 'Unknown driver investigation needed: ' + sim_name]
       );
     }
-    await client.query('COMMIT');
+    await pool.query('COMMIT');
     res.json(inc.rows[0]);
   } catch (err) {
-    await client.query('ROLLBACK');
+    await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
   } finally { client.release(); }
 });
@@ -155,23 +155,23 @@ app.patch('/incident/:id/assign', async (req, res) => {
   const { department, assigned_by, notes } = req.body;
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const r = await client.query(
+    await pool.query('BEGIN');
+    const r = await pool.query(
       "UPDATE incidents SET assigned_to = $1, assigned_at = NOW() WHERE id = $2 RETURNING *",
       [department, req.params.id]
     );
-    await client.query(
+    await pool.query(
       'INSERT INTO assignments (incident_id, assigned_to, assigned_by, notes) VALUES ($1,$2,$3,$4)',
       [req.params.id, department, assigned_by || department, notes || '']
     );
-    await client.query(
+    await pool.query(
       'UPDATE notifications SET seen = true WHERE incident_id = $1 AND department = $2',
       [req.params.id, department]
     );
-    await client.query('COMMIT');
+    await pool.query('COMMIT');
     res.json(r.rows[0]);
   } catch (err) {
-    await client.query('ROLLBACK');
+    await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
   } finally { client.release(); }
 });
@@ -283,8 +283,8 @@ app.post('/violation', async (req, res) => {
           speed_limit, zone_name, violation_date, violation_time } = req.body;
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const v = await client.query(
+    await pool.query('BEGIN');
+    const v = await pool.query(
       `INSERT INTO violations
          (sim_name, avatar_name, vehicle_name, speed_recorded,
           speed_limit, zone_name, violation_date, violation_time)
@@ -293,16 +293,16 @@ app.post('/violation', async (req, res) => {
        speed_limit, zone_name || 'Main Road', violation_date, violation_time]
     );
     const vid = v.rows[0].id;
-    await client.query(
+    await pool.query(
       `INSERT INTO notifications (incident_id, department, message) VALUES ($1,$2,$3)`,
       [vid, 'pd',
        'Speed violation: ' + avatar_name + ' doing ' + speed_recorded +
        ' mph in ' + (zone_name || 'Main Road') + ' (' + speed_limit + ' mph zone)']
     );
-    await client.query('COMMIT');
+    await pool.query('COMMIT');
     res.json(v.rows[0]);
   } catch (err) {
-    await client.query('ROLLBACK');
+    await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
   } finally { client.release(); }
 });
@@ -360,38 +360,38 @@ app.post('/alarm', async (req, res) => {
   const units = Array.isArray(unitsRaw) ? unitsRaw.join(',') : (unitsRaw || null);
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const existing = await client.query(
+    await pool.query('BEGIN');
+    const existing = await pool.query(
       "SELECT id, status, ladder_triggered FROM fire_alarms WHERE detector_code = $1 AND status != 'cleared' AND alarm_type != 'CLEAR'",
       [detector_code]
     );
     let alarm;
     if (alarm_type === 'CLEAR') {
       if (existing.rows.length > 0) {
-        alarm = await client.query(
+        alarm = await pool.query(
           "UPDATE fire_alarms SET alarm_type = 'CLEAR', status = 'cleared', fire_count = 0, smoke_count = 0, last_updated = NOW() WHERE detector_code = $1 AND status != 'cleared' RETURNING *",
           [detector_code]
         );
       } else {
-        await client.query('COMMIT');
+        await pool.query('COMMIT');
         return res.json({ ok: true, message: 'No active alarm to clear' });
       }
     } else if (existing.rows.length > 0) {
       const wasLadder = existing.rows[0].ladder_triggered;
-      alarm = await client.query(
+      alarm = await pool.query(
         "UPDATE fire_alarms SET alarm_type = $1, fire_count = $2, smoke_count = $3, ladder_triggered = $4, last_updated = NOW() WHERE detector_code = $5 AND status != 'cleared' RETURNING *",
         [alarm_type, fire_count || 0, smoke_count || 0, ladder_triggered || false, detector_code]
       );
       if (ladder_triggered && !wasLadder) {
         const alarmId = existing.rows[0].id;
         const location = sim_code + '-' + parcel_code;
-        await client.query(
+        await pool.query(
           'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
           [alarmId, 'fd', 'LADDER ESCALATION: ' + detector_code + ' at ' + location + ' | Fire objects: ' + fire_count, org]
         );
       }
     } else {
-      alarm = await client.query(
+      alarm = await pool.query(
         "INSERT INTO fire_alarms (detector_code, sim_code, parcel_code, detector_num, region, alarm_type, fire_count, smoke_count, ladder_triggered, first_detected, last_updated, status, world_x, world_y, org_code, incident_type, units_dispatched) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),'active',$11,$12,$13,$14,$15) RETURNING *",
         [detector_code, sim_code, parcel_code, detector_num, region,
          alarm_type, fire_count || 0, smoke_count || 0, ladder_triggered || false,
@@ -399,18 +399,18 @@ app.post('/alarm', async (req, res) => {
       );
       const alarmId = alarm.rows[0].id;
       const location = sim_code + '-' + parcel_code;
-      await client.query(
+      await pool.query(
         'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
         [alarmId, 'fd', 'Fire alarm: ' + detector_code + ' at ' + location + ' | ' + alarm_type, org]
       );
-      await client.query(
+      await pool.query(
         'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
         [alarmId, 'pd', 'Fire alarm reported at ' + location + ' (' + region + ')', org]
       );
       // Auto-create a dispatch_call so the alarm persists in the dispatcher
       // queue until a dispatcher manually clears it (FD side still auto-clears).
       const dispSlurl = slurl || ('secondlife://' + (region||'').replace(/ /g,'%20') + '/' + (world_x||128) + '/' + (world_y||128) + '/0');
-      await client.query(
+      await pool.query(
         `INSERT INTO dispatch_calls
            (org_code, caller_name, location, call_type, incident_type, units, notes, status, dispatcher, dispatched, alarm_id, dispatched_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,true,$9,NOW())`,
@@ -420,10 +420,10 @@ app.post('/alarm', async (req, res) => {
          'AUTO (Detector)', alarmId]
       );
     }
-    await client.query('COMMIT');
+    await pool.query('COMMIT');
     res.json(alarm.rows[0]);
   } catch (err) {
-    await client.query('ROLLBACK');
+    await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
   } finally { client.release(); }
 });
@@ -446,6 +446,25 @@ app.get('/alarms/pd', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+app.get('/alarm/active', async (req, res) => {
+  try {
+    const org = req.query.org;
+    if (!org) return res.status(400).json({ error: 'org required' });
+    const r = await pool.query(
+      `SELECT id, region, incident_type, units_dispatched,
+              sim_code, parcel_code, world_x, world_y, created_at, org_code
+       FROM fire_alarms
+       WHERE org_code = $1
+         AND status NOT IN ('cleared','silenced')
+         AND alarm_type != 'CLEAR'
+         AND created_at > NOW() - INTERVAL '4 hours'
+       ORDER BY created_at DESC`,
+      [org]
+    );
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 app.get('/alarms', async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM fire_alarms ORDER BY last_updated DESC');
@@ -551,19 +570,19 @@ app.patch('/alarm-notifications/:dept/reset', async (req, res) => {
     const org = req.query.org || null;
     // Require org to prevent wiping all communities
     if (!org) { return res.json({ ok: true, skipped: 'org required' }); }
-    await client.query('BEGIN');
-    await client.query(
+    await pool.query('BEGIN');
+    await pool.query(
       'UPDATE alarm_notifications SET seen = true, seen_panel = true WHERE department = $1 AND org_code = $2',
       [req.params.dept, org]
     );
-    await client.query(
+    await pool.query(
       "UPDATE fire_alarms SET status = 'cleared' WHERE id IN (SELECT alarm_id FROM alarm_notifications WHERE department = $1 AND org_code = $2) AND org_code = $2",
       [req.params.dept, org]
     );
-    await client.query('COMMIT');
+    await pool.query('COMMIT');
     res.json({ ok: true });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
   } finally { client.release(); }
 });
@@ -617,8 +636,8 @@ app.patch('/alarm-notifications/:dept/beeper/seen', async (req, res) => {
 //  Set to "" to disable for that community
 // ============================================================
 const DISCORD_WEBHOOKS = {
-  rfr:     "https://discord.com/api/webhooks/1512701506649063515/bE_chqAycfPnllc0q3cQU4fV500GT423UdonmVe30e5SKS__PUNHZmxx_assudASUpRg",
-  harmony: "https://discord.com/api/webhooks/1513684583248429096/1YtEtLUQn4vRaihMAr1MvnFfMMSU2MBZSBpnO75A6EGuUCORzz706pc5vwka4REAASDb",
+  rfr:     "https://discord.com/api/webhooks/1519124261619367966/bk1nmsAgA33x8NCKsTbRgLKX5ATFJjzrsqx-kLX3caLFyctnNm-NZR2Jzebx7O6dJBel",
+  harmony: "https://discord.com/api/webhooks/1519126242899525632/-q17o38_4dQNQHeQWk05xHr5a4TTTAhaKEPtc_PLADFtD41Tj5z21o6J_83h0Elc_F98",
   willow:  ""
 };
 
@@ -694,7 +713,7 @@ app.post('/dispatch/medical', async (req, res) => {
     if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch(e) {} }
     const { caller_name, region, issue, timestamp, org_code, incident_type, units } = payload;
     const org = org_code || 'rfr';
-    const alarmResult = await client.query(
+    const alarmResult = await pool.query(
       `INSERT INTO fire_alarms
          (detector_code, sim_code, parcel_code, detector_num, region,
           alarm_type, fire_count, smoke_count, ladder_triggered, status, org_code,
@@ -705,7 +724,7 @@ app.post('/dispatch/medical', async (req, res) => {
        incident_type || null, Array.isArray(units) ? units.join(',') : (units || null)]
     );
     const alarmId = alarmResult.rows[0].id;
-    await client.query(
+    await pool.query(
       'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
       [alarmId, 'fd',
        'Medical emergency reported by ' + caller_name + ' at ' + region + ' | ' + issue, org]
@@ -1029,6 +1048,221 @@ function validateTimeclockKey(req, res, next) {
   req.timeclockOrg = TIMECLOCK_KEYS[key];
   next();
 }
+
+
+
+// ── POST /dispatch/police ─────────────────────────────────────
+app.post('/dispatch/police', async (req, res) => {
+  const { caller_name, region, address, issue, org_code, timestamp } = req.body;
+  const org = org_code || 'hemlock';
+  const ts  = timestamp || new Date().toISOString();
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO dispatch_calls
+         (caller_name, location, incident_type, units, notes, status, org_code, department, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'active', $6, 'PD', NOW())
+       RETURNING id`,
+      [caller_name, address || region, issue, '', '', org]
+    );
+    const callId = result.rows[0].id;
+
+    await postDiscord(org, {
+      embeds: [{
+        title: '🚔 Police Dispatch — ' + region,
+        description: '**Caller:** ' + caller_name + '\n**Location:** ' + (address || region) + '\n**Details:** ' + issue,
+        color: 0x1F6FEB,
+        timestamp: ts
+      }]
+    });
+
+    res.json({ success: true, call_id: callId });
+  } catch (err) {
+    console.error('Police dispatch error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// ── GET /dispatch/fire/trigger (SmartBot GET-based dispatch) ──
+app.get('/dispatch/fire/trigger', async (req, res) => {
+  const { caller, region, address, issue, org, units, incident } = req.query;
+  const org_code = org || 'rfr';
+  try {
+    const result = await pool.query(
+      `INSERT INTO fire_alarms
+         (detector_code, sim_code, region, alarm_type, fire_count, incident_type, units_dispatched, org_code, notes, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', NOW())
+       RETURNING id`,
+      ['DISP', 'DISP', region, 'FIRE', 1, incident || 'Fire', units || '', org_code, (caller || '') + ' | ' + (issue || '')]
+    );
+    const alarmId = result.rows[0].id;
+
+    await pool.query(
+      `INSERT INTO alarm_notifications
+         (alarm_id, org_code, department, message, seen, seen_panel, created_at)
+       VALUES ($1, $2, 'fd', 'SmartBot Dispatch', false, false, NOW())`,
+      [alarmId, org_code]
+    );
+
+    await postDiscord(org_code, {
+      embeds: [{
+        title: '🚒 Fire Dispatch — ' + region,
+        description: '**Caller:** ' + caller + '\n**Incident:** ' + (incident || 'Fire') + '\n**Units:** ' + (units || 'N/A') + '\n**Location:** ' + (address || region) + '\n**Details:** ' + issue,
+        color: 0xFF4500
+      }]
+    });
+
+    res.json({ success: true, alarm_id: alarmId });
+  } catch (err) {
+    console.error('Fire trigger error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /dispatch/medical/trigger (SmartBot GET-based dispatch) ──
+app.get('/dispatch/medical/trigger', async (req, res) => {
+  const { caller, region, address, issue, org, units, incident } = req.query;
+  const org_code = org || 'rfr';
+  try {
+    const result = await pool.query(
+      `INSERT INTO fire_alarms
+         (detector_code, sim_code, region, alarm_type, fire_count, incident_type, units_dispatched, org_code, notes, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', NOW())
+       RETURNING id`,
+      ['DISP', 'DISP', region, 'MEDICAL', 1, incident || 'Medical', units || '', org_code, (caller || '') + ' | ' + (issue || '')]
+    );
+    const alarmId = result.rows[0].id;
+
+    await pool.query(
+      `INSERT INTO alarm_notifications
+         (alarm_id, org_code, department, message, seen, seen_panel, created_at)
+       VALUES ($1, $2, 'fd', 'SmartBot Medical Dispatch', false, false, NOW())`,
+      [alarmId, org_code]
+    );
+
+    await postDiscord(org_code, {
+      embeds: [{
+        title: '🚑 Medical Dispatch — ' + region,
+        description: '**Caller:** ' + caller + '\n**Incident:** ' + (incident || 'Medical') + '\n**Units:** ' + (units || 'N/A') + '\n**Location:** ' + (address || region) + '\n**Details:** ' + issue,
+        color: 0x9B59B6
+      }]
+    });
+
+    res.json({ success: true, alarm_id: alarmId });
+  } catch (err) {
+    console.error('Medical trigger error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /dispatch/police/trigger (SmartBot GET-based dispatch) ──
+app.get('/dispatch/police/trigger', async (req, res) => {
+  const { caller, region, address, issue, org, hostile } = req.query;
+  const org_code = org || 'hemlock';
+  try {
+    const result = await pool.query(
+      `INSERT INTO dispatch_calls
+         (caller_name, location, incident_type, units, notes, status, org_code, department, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'active', $6, 'PD', NOW())
+       RETURNING id`,
+      [caller, address || region, issue, '', hostile === 'true' ? 'HOSTILE' : '', org_code]
+    );
+    const callId = result.rows[0].id;
+
+    await postDiscord(org_code, {
+      embeds: [{
+        title: (hostile === 'true' ? '🚨 ACTIVE THREAT' : '🚔 Police Dispatch') + ' — ' + region,
+        description: '**Caller:** ' + caller + '\n**Location:** ' + (address || region) + '\n**Details:** ' + issue,
+        color: 0x1F6FEB
+      }]
+    });
+
+    res.json({ success: true, call_id: callId });
+  } catch (err) {
+    console.error('Police trigger error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// ── PATCH /dispatch/police/close ─────────────────────────────
+app.patch('/dispatch/police/close', async (req, res) => {
+  const org = req.query.org || 'hemlock';
+  try {
+    await pool.query(
+      `UPDATE dispatch_calls
+       SET status = 'closed', closed_at = NOW()
+       WHERE org_code = $1
+         AND department = 'PD'
+         AND status = 'active'`,
+      [org]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Police close error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /dispatch/police/active ───────────────────────────────
+app.get('/dispatch/police/active', async (req, res) => {
+  const org = req.query.org || 'hemlock';
+  try {
+    const result = await pool.query(
+      `SELECT id, caller_name, location, incident_type, created_at
+       FROM dispatch_calls
+       WHERE org_code = $1
+         AND department = 'PD'
+         AND status = 'active'
+       ORDER BY created_at DESC
+       LIMIT 5`,
+      [org]
+    );
+    if (result.rows.length === 0) return res.json([]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Police active error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+
+// ── POST /dispatch/police ─────────────────────────────────────
+app.post('/dispatch/police', async (req, res) => {
+  const { caller_name, region, address, issue, org_code, timestamp } = req.body;
+  const org = org_code || 'hemlock';
+  const ts  = timestamp || new Date().toISOString();
+
+  try {
+    // Insert into dispatch_calls with department = 'PD'
+    const result = await pool.query(
+      `INSERT INTO dispatch_calls
+         (caller_name, location, incident_type, units, notes, status, org_code, department, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'active', $6, 'PD', NOW())
+       RETURNING id`,
+      [caller_name, address || region, issue, '', '', org]
+    );
+    const callId = result.rows[0].id;
+
+    // Discord webhook (blue)
+    await postDiscord(org, {
+      embeds: [{
+        title: '🚔 Police Dispatch — ' + region,
+        description: '**Caller:** ' + caller_name + '\n**Location:** ' + (address || region) + '\n**Details:** ' + issue,
+        color: 0x1F6FEB,
+        timestamp: ts
+      }]
+    });
+
+    res.json({ success: true, call_id: callId });
+  } catch (err) {
+    console.error('Police dispatch error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 app.post('/timeclock', validateTimeclockKey, async (req, res) => {
   try {
@@ -1999,13 +2233,13 @@ app.patch('/dispatch/call/:id/dispatch', async (req, res) => {
     var payload = req.body;
     if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch(e) {} }
     const { call_type, incident_type, units } = payload;
-    const callRes = await client.query('SELECT * FROM dispatch_calls WHERE id = $1', [req.params.id]);
+    const callRes = await pool.query('SELECT * FROM dispatch_calls WHERE id = $1', [req.params.id]);
     if (callRes.rows.length === 0) return res.status(404).json({ error: 'Call not found' });
     const call = callRes.rows[0];
     const org = call.org_code;
     const unitsStr = Array.isArray(units) ? units.join(',') : (units || '');
     const alarmType = (call_type === 'medical') ? 'MEDICAL' : 'FIRE';
-    const alarmResult = await client.query(
+    const alarmResult = await pool.query(
       `INSERT INTO fire_alarms
          (detector_code, sim_code, parcel_code, detector_num, region,
           alarm_type, fire_count, smoke_count, ladder_triggered, status, org_code,
@@ -2016,12 +2250,12 @@ app.patch('/dispatch/call/:id/dispatch', async (req, res) => {
        incident_type || null, unitsStr || null]
     );
     const alarmId = alarmResult.rows[0].id;
-    await client.query(
+    await pool.query(
       'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
       [alarmId, 'fd',
        (alarmType==='MEDICAL'?'Medical':'Fire') + ' dispatch by ' + (call.dispatcher||'Dispatcher') + ' | ' + (incident_type||'') + ' | ' + (call.caller_name||''), org]
     );
-    await client.query(
+    await pool.query(
       "UPDATE dispatch_calls SET call_type=$1, incident_type=$2, units=$3, dispatched=true, dispatched_at=NOW(), alarm_id=$4 WHERE id=$5",
       [call_type || 'fire', incident_type || '', unitsStr, alarmId, req.params.id]
     );
@@ -2054,6 +2288,143 @@ app.patch('/dispatch/call/:id/close', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+
+
+// ============================================================
+// CRIMINAL EMPIRES — Phase 1 Economy Routes
+// ============================================================
+
+// Register/upsert a criminal into ce_criminals and CivCore civilians
+app.post('/ce/criminal/register', async (req, res) => {
+  const { avatar_uuid, avatar_name, community_org } = req.body;
+  if (!avatar_uuid || !avatar_name || !community_org) return res.status(400).json({ error: 'Missing fields' });
+  const sanitizedName = avatar_name.replace(/'/g, "''");
+  try {
+    // Upsert ce_criminals
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET avatar_name=$2, last_active=NOW()`,
+      [avatar_uuid, avatar_name, community_org]
+    );
+    // Upsert CivCore civilians (so they appear in civilian registry)
+    await pool.query(
+      `INSERT INTO civilians (avatar_uuid, avatar_name)
+       VALUES ($1, $2)
+       ON CONFLICT (avatar_uuid) DO NOTHING`,
+      [avatar_uuid, avatar_name]
+    );
+    const result = await pool.query(
+      `SELECT * FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [avatar_uuid, community_org]
+    );
+    res.json({ success: true, criminal: result.rows[0] });
+  } catch (err) {
+    console.error('CE register error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Register a robbable item (called by item script on_rez or owner touch)
+app.post('/ce/item/register', async (req, res) => {
+  const { item_code, item_name, item_type, owner_uuid, owner_name, community_org, region, sim_x, sim_y, sim_z, base_value } = req.body;
+  if (!item_code || !item_name || !community_org) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    await pool.query(
+      `INSERT INTO ce_items (item_code, item_name, item_type, owner_uuid, owner_name, community_org, region, sim_x, sim_y, sim_z, base_value, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'available')
+       ON CONFLICT (item_code) DO UPDATE SET
+         item_name=$2, item_type=$3, owner_uuid=$4, owner_name=$5,
+         community_org=$6, region=$7, sim_x=$8, sim_y=$9, sim_z=$10,
+         base_value=$11, status='available', stolen_by_uuid=NULL,
+         stolen_by_name=NULL, stolen_at=NULL`,
+      [item_code, item_name, item_type, owner_uuid, owner_name, community_org, region, sim_x||0, sim_y||0, sim_z||0, base_value||100]
+    );
+    res.json({ success: true, item_code });
+  } catch (err) {
+    console.error('CE item register error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Steal an item
+app.post('/ce/item/steal', async (req, res) => {
+  const { item_code, criminal_uuid, criminal_name, community_org } = req.body;
+  if (!item_code || !criminal_uuid || !community_org) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const check = await pool.query(`SELECT * FROM ce_items WHERE item_code=$1`, [item_code]);
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    if (check.rows[0].status !== 'available') return res.status(409).json({ error: 'Item already stolen' });
+    await pool.query(
+      `UPDATE ce_items SET status='stolen', stolen_by_uuid=$1, stolen_by_name=$2, stolen_at=NOW() WHERE item_code=$3`,
+      [criminal_uuid, criminal_name, item_code]
+    );
+    // Increment criminal stats
+    await pool.query(
+      `UPDATE ce_criminals SET total_steals=total_steals+1, heat_level=heat_level+10, last_active=NOW()
+       WHERE avatar_uuid=$1 AND community_org=$2`,
+      [criminal_uuid, community_org]
+    );
+    res.json({ success: true, item: check.rows[0].item_name, value: check.rows[0].base_value });
+  } catch (err) {
+    console.error('CE steal error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get criminal's stolen inventory
+app.get('/ce/inventory', async (req, res) => {
+  const { uuid, org } = req.query;
+  if (!uuid || !org) return res.status(400).json({ error: 'Missing uuid or org' });
+  try {
+    const items = await pool.query(
+      `SELECT id, item_code, item_name, item_type, base_value, stolen_at
+       FROM ce_items WHERE stolen_by_uuid=$1 AND community_org=$2 AND status='stolen'
+       ORDER BY stolen_at DESC`,
+      [uuid, org]
+    );
+    const criminal = await pool.query(
+      `SELECT heat_level, total_steals, total_fenced, total_earnings, skill_level, bank_balance, cash_on_hand, role FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [uuid, org]
+    );
+    res.json({ items: items.rows, stats: criminal.rows[0] || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fence an item at pawn shop
+app.post('/ce/item/fence', async (req, res) => {
+  const { item_code, criminal_uuid, criminal_name, community_org, payout_pct } = req.body;
+  if (!item_code || !criminal_uuid || !community_org) return res.status(400).json({ error: 'Missing fields' });
+  const pct = parseInt(payout_pct) || 40;
+  try {
+    const check = await pool.query(`SELECT * FROM ce_items WHERE item_code=$1`, [item_code]);
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    if (check.rows[0].status !== 'stolen') return res.status(409).json({ error: 'Item not in stolen state' });
+    if (check.rows[0].stolen_by_uuid !== criminal_uuid) return res.status(403).json({ error: 'Not your item' });
+    const payout = Math.floor(check.rows[0].base_value * (pct / 100));
+    // Mark fenced
+    await pool.query(`UPDATE ce_items SET status='fenced' WHERE item_code=$1`, [item_code]);
+    // Log transaction
+    await pool.query(
+      `INSERT INTO ce_transactions (item_code, item_name, criminal_uuid, criminal_name, community_org, base_value, payout, payout_pct)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [item_code, check.rows[0].item_name, criminal_uuid, criminal_name, community_org, check.rows[0].base_value, payout, pct]
+    );
+    // Update criminal stats
+    await pool.query(
+      `UPDATE ce_criminals SET total_fenced=total_fenced+1, total_earnings=total_earnings+$1, heat_level=GREATEST(0, heat_level-5), last_active=NOW()
+       WHERE avatar_uuid=$2 AND community_org=$3`,
+      [payout, criminal_uuid, community_org]
+    );
+    res.json({ success: true, item_name: check.rows[0].item_name, base_value: check.rows[0].base_value, payout, payout_pct: pct });
+  } catch (err) {
+    console.error('CE fence error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.listen(3000, () => console.log('RDS API running on port 3000'));
 
@@ -2125,7 +2496,7 @@ app.post('/org/:org/dispatch/fire', async (req, res) => {
     const { caller_name, region, address, issue, timestamp } = payload;
     const org_code = req.params.org;
     const parcel_code = address || 'UNKNOWN';
-    const alarmResult = await client.query(
+    const alarmResult = await pool.query(
       `INSERT INTO fire_alarms
          (detector_code, sim_code, parcel_code, detector_num, region,
           alarm_type, fire_count, smoke_count, ladder_triggered, status, first_detected, org_code)
@@ -2133,7 +2504,7 @@ app.post('/org/:org/dispatch/fire', async (req, res) => {
       ['DISPATCH','DISP',parcel_code,'D1',region||'UNKNOWN','FIRE',1,0,false,'active',org_code]
     );
     const alarmId = alarmResult.rows[0].id;
-    await client.query(
+    await pool.query(
       'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
       [alarmId,'fd','Fire reported by '+caller_name+' | '+issue, org_code]
     );
@@ -2149,7 +2520,7 @@ app.post('/org/:org/dispatch/medical', async (req, res) => {
     if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch(e) {} }
     const { caller_name, region, issue, timestamp } = payload;
     const org_code = req.params.org;
-    const alarmResult = await client.query(
+    const alarmResult = await pool.query(
       `INSERT INTO fire_alarms
          (detector_code, sim_code, parcel_code, detector_num, region,
           alarm_type, fire_count, smoke_count, ladder_triggered, status, first_detected, org_code)
@@ -2157,7 +2528,7 @@ app.post('/org/:org/dispatch/medical', async (req, res) => {
       ['DISPATCH','DISP',region||'UNKNOWN','D1',region||'UNKNOWN','MEDICAL',0,0,false,'active',org_code]
     );
     const alarmId = alarmResult.rows[0].id;
-    await client.query(
+    await pool.query(
       'INSERT INTO alarm_notifications (alarm_id, department, message, org_code) VALUES ($1,$2,$3,$4)',
       [alarmId,'fd','Medical reported by '+caller_name+' at '+(region||'UNKNOWN')+' | '+issue, org_code]
     );
@@ -2408,10 +2779,10 @@ app.post('/alarm/burglary', async (req, res) => {
     const { panel_uuid, community_org, location, parcel_name, region, slurl, world_x, world_y, trigger_type, suspect_uuid, suspect_name } = p;
     const org = community_org || 'hemlock';
 
-    await client.query('BEGIN');
+    await pool.query('BEGIN');
 
     // Create PD incident automatically
-    const incResult = await client.query(
+    const incResult = await pool.query(
       `INSERT INTO pd_incidents (community_org, incident_type, location, slurl, description, reporting_officer, status, created_at)
        VALUES ($1,'Burglary Alarm',$2,$3,$4,'RES Security System','active',NOW()) RETURNING id`,
       [org, location||parcel_name||region||'Unknown', slurl||'', 'Automatic alarm trigger at ' + (parcel_name||location||region||'Unknown')]
@@ -2419,19 +2790,19 @@ app.post('/alarm/burglary', async (req, res) => {
     const pdIncidentId = incResult.rows[0].id;
 
     // Create burglary incident record
-    const burgResult = await client.query(
+    const burgResult = await pool.query(
       `INSERT INTO burglary_incidents (community_org, panel_uuid, location, parcel_name, region, slurl, world_x, world_y, trigger_type, suspect_uuid, suspect_name, status, pd_incident_id, triggered_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'open',$12,NOW()) RETURNING id`,
       [org, panel_uuid||'', location||'', parcel_name||'', region||'', slurl||'', world_x||0, world_y||0, trigger_type||'motion', suspect_uuid||'', suspect_name||'', pdIncidentId]
     );
     const burgId = burgResult.rows[0].id;
 
-    await client.query('COMMIT');
+    await pool.query('COMMIT');
 
     console.log('[burglary] Alarm triggered at ' + (parcel_name||location||'Unknown') + ' | PD incident #' + pdIncidentId);
     res.json({ success: true, burglary_id: burgId, pd_incident_id: pdIncidentId });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
   } finally { client.release(); }
 });
