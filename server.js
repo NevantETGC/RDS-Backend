@@ -2229,6 +2229,7 @@ app.post('/ce/item/fence', async (req, res) => {
       [payout, criminal_uuid, community_org]
     );
     const fenceXp = await ceAddXp(criminal_uuid, community_org, payout);
+    const fenceCut = await ceCrewCut(criminal_uuid, community_org, payout);
     res.json({ success: true, item_name: check.rows[0].item_name, base_value: check.rows[0].base_value, payout, payout_pct: pct, level: fenceXp ? fenceXp.level : 1, leveled_up: fenceXp ? fenceXp.leveled_up : false, rank: fenceXp ? fenceXp.rank : "" });
   } catch (err) {
     console.error('CE fence error:', err);
@@ -2474,9 +2475,696 @@ app.post("/ce/bank/rob", async (req, res) => {
       ["BANK-" + Date.now(), "BANK ROBBERY", avatar_uuid, avatar_name || "Unknown", community_org, payout, payout]
     );
     const xpInfo = await ceAddXp(avatar_uuid, community_org, 250);
+    await ceCrewCut(avatar_uuid, community_org, payout);
     res.json({ success: true, payout: payout, heat_added: 5, level: xpInfo ? xpInfo.level : 0, leveled_up: xpInfo ? xpInfo.leveled_up : false, rank: xpInfo ? xpInfo.rank : "" });
   } catch (err) {
     console.error("CE bank rob error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — City Economy: Cash Register Tills
+// ============================================================
+
+// Register a till (business cash register)
+// Business capacity scales with owner level
+function ceBusinessStats(level) {
+  let lvl = parseInt(level) || 1;
+  if (lvl < 1) lvl = 1;
+  return {
+    max_balance: 250 + (lvl * 50),
+    fill_rate: 10 + (lvl * 2),
+    min_rob_level: Math.max(1, Math.floor(lvl / 4)),
+    license_fee: 1000 + (lvl * 200)
+  };
+}
+
+app.post("/ce/till/register", async (req, res) => {
+  const { register_code, business_name, owner_uuid, owner_name, community_org, region } = req.body;
+  if (!register_code || !owner_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET avatar_name=$2, last_active=NOW()`,
+      [owner_uuid, owner_name || "Business Owner", community_org]
+    );
+    const o = await pool.query(
+      `SELECT level, bank_balance FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [owner_uuid, community_org]
+    );
+    const lvl = o.rows[0].level || 1;
+    const bank = o.rows[0].bank_balance || 0;
+    const stats = ceBusinessStats(lvl);
+
+    const existing = await pool.query(`SELECT license_paid FROM ce_registers WHERE register_code=$1`, [register_code]);
+    if (existing.rows.length > 0 && existing.rows[0].license_paid) {
+      await pool.query(
+        `UPDATE ce_registers SET business_name=$2, owner_name=$3, region=$4,
+         fill_rate=$5, max_balance=$6, min_rob_level=$7 WHERE register_code=$1`,
+        [register_code, business_name || "Business", owner_name || "", region || "",
+         stats.fill_rate, stats.max_balance, stats.min_rob_level]
+      );
+      return res.json({ success: true, register_code, licensed: true, level: lvl,
+        max_balance: stats.max_balance, fill_rate: stats.fill_rate, min_rob_level: stats.min_rob_level });
+    }
+
+    if (bank < stats.license_fee) {
+      return res.status(403).json({ error: "Business license costs L$" + stats.license_fee + " from your bank. You have L$" + bank + "." });
+    }
+    await pool.query(`UPDATE ce_criminals SET bank_balance=bank_balance-$1 WHERE avatar_uuid=$2 AND community_org=$3`,
+      [stats.license_fee, owner_uuid, community_org]);
+    await pool.query(`UPDATE ce_city SET treasury=treasury+$1 WHERE community_org=$2`,
+      [stats.license_fee, community_org]);
+
+    await pool.query(
+      `INSERT INTO ce_registers (register_code, business_name, owner_uuid, owner_name, community_org, region, fill_rate, max_balance, min_rob_level, license_paid, license_fee, tier)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11)
+       ON CONFLICT (register_code) DO UPDATE SET
+         business_name=$2, owner_uuid=$3, owner_name=$4, community_org=$5, region=$6,
+         fill_rate=$7, max_balance=$8, min_rob_level=$9, license_paid=TRUE, license_fee=$10, tier=$11`,
+      [register_code, business_name || "Business", owner_uuid, owner_name || "", community_org, region || "",
+       stats.fill_rate, stats.max_balance, stats.min_rob_level, stats.license_fee, lvl]
+    );
+    res.json({ success: true, register_code, licensed: true, level: lvl,
+      fee_charged: stats.license_fee, remaining_bank: bank - stats.license_fee,
+      max_balance: stats.max_balance, fill_rate: stats.fill_rate, min_rob_level: stats.min_rob_level });
+  } catch (err) {
+    console.error("CE till register error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/ce/till/status", async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).json({ error: "Missing code" });
+  try {
+    const r = await pool.query(
+      `SELECT r.business_name, r.balance, r.owner_uuid, COALESCE(cr.level,1) AS owner_level
+       FROM ce_registers r
+       LEFT JOIN ce_criminals cr ON cr.avatar_uuid = r.owner_uuid AND cr.community_org = r.community_org
+       WHERE r.register_code=$1`, [code]);
+    if (r.rows.length === 0) return res.status(404).json({ error: "Till not registered" });
+    const stats = ceBusinessStats(r.rows[0].owner_level);
+    res.json({
+      business_name: r.rows[0].business_name,
+      balance: r.rows[0].balance,
+      max_balance: stats.max_balance,
+      fill_rate: stats.fill_rate,
+      min_rob_level: stats.min_rob_level,
+      owner_level: r.rows[0].owner_level,
+      owner_uuid: r.rows[0].owner_uuid
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Owner collects till — clean income to bank_balance
+app.post("/ce/till/collect", async (req, res) => {
+  const { register_code, avatar_uuid, community_org } = req.body;
+  if (!register_code || !avatar_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const t = await pool.query(`SELECT * FROM ce_registers WHERE register_code=$1`, [register_code]);
+    if (t.rows.length === 0) return res.status(404).json({ error: "Till not registered" });
+    if (t.rows[0].owner_uuid !== avatar_uuid) return res.status(403).json({ error: "Not your till" });
+    const amount = t.rows[0].balance;
+    if (amount <= 0) return res.status(409).json({ error: "Till is empty" });
+    await pool.query(`UPDATE ce_registers SET balance=0, last_collected=NOW() WHERE register_code=$1`, [register_code]);
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (avatar_uuid, community_org) DO NOTHING`,
+      [avatar_uuid, t.rows[0].owner_name || "Business Owner", community_org]
+    );
+    const u = await pool.query(
+      `UPDATE ce_criminals SET bank_balance=bank_balance+$1, last_active=NOW()
+       WHERE avatar_uuid=$2 AND community_org=$3 RETURNING bank_balance`,
+      [amount, avatar_uuid, community_org]
+    );
+    res.json({ success: true, collected: amount, bank_balance: u.rows.length ? u.rows[0].bank_balance : 0 });
+  } catch (err) {
+    console.error("CE till collect error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Criminal robs till — dirty cash, +heat, cooldown
+// Crack time based on level + lockpick
+function ceCrackTime(level, hasLockpick) {
+  let t = 20 - Math.floor(level / 5);
+  if (hasLockpick) t = t - 5;
+  if (t < 8) t = 8;
+  return t;
+}
+
+// Pre-rob check — returns crack time and tool loadout
+app.post("/ce/till/attempt", async (req, res) => {
+  const { register_code, criminal_uuid, criminal_name, community_org } = req.body;
+  if (!register_code || !criminal_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const t = await pool.query(`SELECT * FROM ce_registers WHERE register_code=$1`, [register_code]);
+    if (t.rows.length === 0) return res.status(404).json({ error: "Till not registered" });
+    if (t.rows[0].owner_uuid === criminal_uuid) return res.status(403).json({ error: "You cannot rob your own till" });
+    if (t.rows[0].balance <= 0) return res.status(409).json({ error: "The register is empty" });
+    if (t.rows[0].last_robbed) {
+      const rmins = (Date.now() - new Date(t.rows[0].last_robbed).getTime()) / 60000;
+      if (rmins < 30) return res.status(429).json({ error: "This register was just hit. Try again in " + Math.ceil(30 - rmins) + " min." });
+    }
+    if (t.rows[0].last_robbed) {
+      const mins = (Date.now() - new Date(t.rows[0].last_robbed).getTime()) / 60000;
+      if (mins < 30) return res.status(429).json({ error: "This register was just hit. Wait " + Math.ceil(30 - mins) + " min." });
+    }
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET avatar_name=$2, last_active=NOW()`,
+      [criminal_uuid, criminal_name || "Unknown", community_org]
+    );
+    const c = await pool.query(
+      `SELECT level, gloves_uses, mask_uses, lockpick_uses, jammer_uses FROM ce_criminals
+       WHERE avatar_uuid=$1 AND community_org=$2`, [criminal_uuid, community_org]
+    );
+    const lvl = c.rows[0].level || 1;
+    if (lvl < t.rows[0].min_rob_level) {
+      return res.status(403).json({ error: "Level " + t.rows[0].min_rob_level + " required. You are level " + lvl + "." });
+    }
+    const hasPick = c.rows[0].lockpick_uses > 0;
+    res.json({
+      success: true,
+      crack_seconds: ceCrackTime(lvl, hasPick),
+      level: lvl,
+      has_lockpick: hasPick,
+      has_mask: c.rows[0].mask_uses > 0,
+      has_gloves: c.rows[0].gloves_uses > 0,
+      has_jammer: c.rows[0].jammer_uses > 0
+    });
+  } catch (err) {
+    console.error("CE till attempt error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Criminal robs till — consumes tools, applies effects
+app.post("/ce/till/rob", async (req, res) => {
+  const { register_code, criminal_uuid, criminal_name, community_org } = req.body;
+  if (!register_code || !criminal_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const t = await pool.query(`SELECT * FROM ce_registers WHERE register_code=$1`, [register_code]);
+    if (t.rows.length === 0) return res.status(404).json({ error: "Till not registered" });
+    if (t.rows[0].owner_uuid === criminal_uuid) return res.status(403).json({ error: "You cannot rob your own till" });
+    if (t.rows[0].balance <= 0) return res.status(409).json({ error: "The register is empty" });
+    if (t.rows[0].last_robbed) {
+      const rmins = (Date.now() - new Date(t.rows[0].last_robbed).getTime()) / 60000;
+      if (rmins < 30) return res.status(429).json({ error: "This register was just hit. Try again in " + Math.ceil(30 - rmins) + " min." });
+    }
+    if (t.rows[0].last_robbed) {
+      const mins = (Date.now() - new Date(t.rows[0].last_robbed).getTime()) / 60000;
+      if (mins < 30) return res.status(429).json({ error: "This register was just hit. Wait " + Math.ceil(30 - mins) + " min." });
+    }
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET avatar_name=$2, last_active=NOW()`,
+      [criminal_uuid, criminal_name || "Unknown", community_org]
+    );
+    const c = await pool.query(
+      `SELECT level, gloves_uses, mask_uses, lockpick_uses, jammer_uses FROM ce_criminals
+       WHERE avatar_uuid=$1 AND community_org=$2`, [criminal_uuid, community_org]
+    );
+    const lvl = c.rows[0].level || 1;
+    if (lvl < t.rows[0].min_rob_level) {
+      return res.status(403).json({ error: "Level " + t.rows[0].min_rob_level + " required. You are level " + lvl + "." });
+    }
+
+    const usedGloves = c.rows[0].gloves_uses > 0;
+    const usedMask = c.rows[0].mask_uses > 0;
+    const usedPick = c.rows[0].lockpick_uses > 0;
+    const usedJammer = c.rows[0].jammer_uses > 0;
+
+    let payout = t.rows[0].balance;
+    let heat = 3;
+    if (!usedPick) {
+      payout = Math.floor(payout * 0.75);
+      heat = heat + 1;
+    }
+    let thiefName = criminal_name || "Unknown";
+    if (usedMask) thiefName = "Unknown";
+
+    if (usedGloves) await pool.query(`UPDATE ce_criminals SET gloves_uses=gloves_uses-1 WHERE avatar_uuid=$1 AND community_org=$2`, [criminal_uuid, community_org]);
+    if (usedMask) await pool.query(`UPDATE ce_criminals SET mask_uses=mask_uses-1 WHERE avatar_uuid=$1 AND community_org=$2`, [criminal_uuid, community_org]);
+    if (usedPick) await pool.query(`UPDATE ce_criminals SET lockpick_uses=lockpick_uses-1 WHERE avatar_uuid=$1 AND community_org=$2`, [criminal_uuid, community_org]);
+    if (usedJammer) await pool.query(`UPDATE ce_criminals SET jammer_uses=jammer_uses-1 WHERE avatar_uuid=$1 AND community_org=$2`, [criminal_uuid, community_org]);
+
+    await pool.query(`UPDATE ce_registers SET balance=0, last_robbed=NOW() WHERE register_code=$1`, [register_code]);
+    await pool.query(
+      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand+$1, heat_level=LEAST(10, heat_level+$2), last_active=NOW()
+       WHERE avatar_uuid=$3 AND community_org=$4`,
+      [payout, heat, criminal_uuid, community_org]
+    );
+    await pool.query(
+      `INSERT INTO ce_transactions (item_code, item_name, criminal_uuid, criminal_name, community_org, base_value, payout, payout_pct, fingerprints_present)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,100,$8)`,
+      [register_code, "REGISTER ROBBERY: " + t.rows[0].business_name, criminal_uuid, thiefName, community_org, t.rows[0].balance, payout, !usedGloves]
+    );
+    const xpInfo = await ceAddXp(criminal_uuid, community_org, 50);
+    await pool.query(
+      `INSERT INTO ce_crime_scenes (register_code, business_name, community_org, region, suspect_uuid, suspect_name, amount_taken, prints_left, name_known, alarm_sounded, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open')`,
+      [register_code, t.rows[0].business_name, community_org, t.rows[0].region || "",
+       criminal_uuid, criminal_name || "Unknown", payout,
+       !usedGloves, !usedMask, !usedJammer]
+    );
+    await ceCrewCut(criminal_uuid, community_org, payout);
+    res.json({
+      success: true, payout: payout, heat_added: heat,
+      used_gloves: usedGloves, used_mask: usedMask, used_lockpick: usedPick, used_jammer: usedJammer,
+      alarm_suppressed: usedJammer,
+      level: xpInfo ? xpInfo.level : 0, leveled_up: xpInfo ? xpInfo.leveled_up : false, rank: xpInfo ? xpInfo.rank : ""
+    });
+  } catch (err) {
+    console.error("CE till rob error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// CRIMINAL EMPIRES — Structure Damage System
+// ============================================================
+
+app.post("/ce/structure/register", async (req, res) => {
+  const { structure_code, structure_name, structure_type, owner_uuid, owner_name, community_org, region, max_hp, register_code } = req.body;
+  if (!structure_code || !owner_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  const hp = parseInt(max_hp) || 100;
+  try {
+    await pool.query(
+      `INSERT INTO ce_structures (structure_code, structure_name, structure_type, owner_uuid, owner_name, community_org, region, hp, max_hp)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+       ON CONFLICT (structure_code) DO UPDATE SET
+         structure_name=$2, structure_type=$3, owner_name=$5, region=$7, max_hp=$8`,
+      [structure_code, structure_name || "Building", structure_type || "business", owner_uuid, owner_name || "", community_org, region || "", hp]
+    );
+    if (register_code) {
+      await pool.query(`UPDATE ce_registers SET structure_code=$1 WHERE register_code=$2`, [structure_code, register_code]);
+    }
+    const r = await pool.query(`SELECT hp, max_hp, status FROM ce_structures WHERE structure_code=$1`, [structure_code]);
+    res.json({ success: true, hp: r.rows[0].hp, max_hp: r.rows[0].max_hp, status: r.rows[0].status });
+  } catch (err) {
+    console.error("CE structure register error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/ce/structure/damage", async (req, res) => {
+  const { structure_code, amount, source, attacker_uuid, attacker_name } = req.body;
+  if (!structure_code) return res.status(400).json({ error: "Missing structure_code" });
+  const dmg = parseInt(amount) || 1;
+  try {
+    const t = await pool.query(`SELECT * FROM ce_structures WHERE structure_code=$1`, [structure_code]);
+    if (t.rows.length === 0) return res.status(404).json({ error: "Structure not registered" });
+    const newHp = Math.max(0, t.rows[0].hp - dmg);
+    let status = "operational";
+    if (newHp === 0) { status = "destroyed"; }
+    else if (newHp < t.rows[0].max_hp * 0.5) { status = "damaged"; }
+    await pool.query(
+      `UPDATE ce_structures SET hp=$1, status=$2, last_damaged=NOW(),
+       damaged_by_uuid=COALESCE($3, damaged_by_uuid), damaged_by_name=COALESCE($4, damaged_by_name)
+       WHERE structure_code=$5`,
+      [newHp, status, attacker_uuid || null, attacker_name || null, structure_code]
+    );
+    res.json({ success: true, hp: newHp, max_hp: t.rows[0].max_hp, status, source: source || "unknown" });
+  } catch (err) {
+    console.error("CE structure damage error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/ce/structure/repair", async (req, res) => {
+  const { structure_code, avatar_uuid, community_org } = req.body;
+  if (!structure_code || !avatar_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const t = await pool.query(`SELECT * FROM ce_structures WHERE structure_code=$1`, [structure_code]);
+    if (t.rows.length === 0) return res.status(404).json({ error: "Structure not registered" });
+    if (t.rows[0].owner_uuid !== avatar_uuid) return res.status(403).json({ error: "Not your building" });
+    const missing = t.rows[0].max_hp - t.rows[0].hp;
+    if (missing <= 0) return res.status(409).json({ error: "Building is not damaged" });
+    const cost = missing * 20;
+    const o = await pool.query(`SELECT bank_balance FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`, [avatar_uuid, community_org]);
+    if (o.rows.length === 0) return res.status(404).json({ error: "Owner not registered" });
+    if (o.rows[0].bank_balance < cost) return res.status(403).json({ error: "Repairs cost L$" + cost + ". You have L$" + o.rows[0].bank_balance + "." });
+    await pool.query(`UPDATE ce_criminals SET bank_balance=bank_balance-$1 WHERE avatar_uuid=$2 AND community_org=$3`, [cost, avatar_uuid, community_org]);
+    await pool.query(`UPDATE ce_city SET treasury=treasury+$1 WHERE community_org=$2`, [cost, community_org]);
+    await pool.query(`UPDATE ce_structures SET hp=max_hp, status='operational', last_repaired=NOW() WHERE structure_code=$1`, [structure_code]);
+    res.json({ success: true, repaired: missing, cost: cost, remaining_bank: o.rows[0].bank_balance - cost });
+  } catch (err) {
+    console.error("CE structure repair error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/ce/structure/status", async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).json({ error: "Missing code" });
+  try {
+    const r = await pool.query(`SELECT structure_name, hp, max_hp, status, damaged_by_name FROM ce_structures WHERE structure_code=$1`, [code]);
+    if (r.rows.length === 0) return res.status(404).json({ error: "Not registered" });
+    res.json(r.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — Crew System
+// ============================================================
+
+// Skim a cut of a payout into the members crew vault. Returns cut taken.
+async function ceCrewCut(uuid, org, payout) {
+  const m = await pool.query(
+    `SELECT c.id, c.cut_pct FROM ce_crews c
+     JOIN ce_crew_members cm ON cm.crew_id = c.id
+     WHERE cm.avatar_uuid=$1 AND c.community_org=$2`, [uuid, org]);
+  if (m.rows.length === 0) return 0;
+  const cut = Math.floor(payout * (m.rows[0].cut_pct / 100));
+  if (cut > 0) {
+    await pool.query(`UPDATE ce_crews SET vault_balance=vault_balance+$1, total_earned=total_earned+$1 WHERE id=$2`, [cut, m.rows[0].id]);
+  }
+  return cut;
+}
+
+// Create a crew (safe prim registers it)
+app.post("/ce/crew/create", async (req, res) => {
+  const { safe_code, crew_name, leader_uuid, leader_name, community_org } = req.body;
+  if (!safe_code || !leader_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const exists = await pool.query(`SELECT id, crew_name, leader_uuid FROM ce_crews WHERE safe_code=$1`, [safe_code]);
+    if (exists.rows.length > 0) {
+      return res.json({ success: true, crew_id: exists.rows[0].id, crew_name: exists.rows[0].crew_name, existing: true });
+    }
+    const already = await pool.query(
+      `SELECT c.id FROM ce_crews c WHERE c.leader_uuid=$1 AND c.community_org=$2`, [leader_uuid, community_org]);
+    if (already.rows.length > 0) return res.status(409).json({ error: "You already lead a crew." });
+
+    const c = await pool.query(
+      `INSERT INTO ce_crews (crew_name, community_org, leader_uuid, leader_name, safe_code)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [crew_name || "Unnamed Crew", community_org, leader_uuid, leader_name || "", safe_code]);
+    const crewId = c.rows[0].id;
+    await pool.query(
+      `INSERT INTO ce_crew_members (crew_id, avatar_uuid, avatar_name, crew_rank)
+       VALUES ($1,$2,$3,'Boss') ON CONFLICT DO NOTHING`,
+      [crewId, leader_uuid, leader_name || ""]);
+    await pool.query(`UPDATE ce_criminals SET crew_id=$1 WHERE avatar_uuid=$2 AND community_org=$3`, [crewId, leader_uuid, community_org]);
+    res.json({ success: true, crew_id: crewId, crew_name: crew_name || "Unnamed Crew", created: true });
+  } catch (err) {
+    console.error("CE crew create error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Join a crew by touching its safe
+app.post("/ce/crew/join", async (req, res) => {
+  const { safe_code, avatar_uuid, avatar_name, community_org } = req.body;
+  if (!safe_code || !avatar_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const c = await pool.query(`SELECT id, crew_name FROM ce_crews WHERE safe_code=$1`, [safe_code]);
+    if (c.rows.length === 0) return res.status(404).json({ error: "No crew registered to this safe" });
+    const crewId = c.rows[0].id;
+    const dupe = await pool.query(`SELECT id FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    if (dupe.rows.length > 0) return res.status(409).json({ error: "You are already in a crew. Leave it first." });
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org)
+       VALUES ($1,$2,$3) ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET avatar_name=$2`,
+      [avatar_uuid, avatar_name || "Recruit", community_org]);
+    await pool.query(
+      `INSERT INTO ce_crew_members (crew_id, avatar_uuid, avatar_name, crew_rank)
+       VALUES ($1,$2,$3,'Soldier')`, [crewId, avatar_uuid, avatar_name || "Recruit"]);
+    await pool.query(`UPDATE ce_criminals SET crew_id=$1 WHERE avatar_uuid=$2 AND community_org=$3`, [crewId, avatar_uuid, community_org]);
+    res.json({ success: true, crew_name: c.rows[0].crew_name });
+  } catch (err) {
+    console.error("CE crew join error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Leave crew
+app.post("/ce/crew/leave", async (req, res) => {
+  const { avatar_uuid, community_org } = req.body;
+  if (!avatar_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const m = await pool.query(
+      `SELECT cm.crew_id, cm.crew_rank FROM ce_crew_members cm WHERE cm.avatar_uuid=$1`, [avatar_uuid]);
+    if (m.rows.length === 0) return res.status(404).json({ error: "You are not in a crew" });
+    if (m.rows[0].crew_rank === "Boss") return res.status(403).json({ error: "The boss cannot leave. Disband instead." });
+    await pool.query(`DELETE FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    await pool.query(`UPDATE ce_criminals SET crew_id=NULL WHERE avatar_uuid=$1 AND community_org=$2`, [avatar_uuid, community_org]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Crew status — vault, roster, tool stock
+app.get("/ce/crew/status", async (req, res) => {
+  const { safe_code, uuid } = req.query;
+  try {
+    let crew;
+    if (safe_code) {
+      crew = await pool.query(`SELECT * FROM ce_crews WHERE safe_code=$1`, [safe_code]);
+    } else if (uuid) {
+      crew = await pool.query(
+        `SELECT c.* FROM ce_crews c JOIN ce_crew_members cm ON cm.crew_id=c.id WHERE cm.avatar_uuid=$1`, [uuid]);
+    } else {
+      return res.status(400).json({ error: "Need safe_code or uuid" });
+    }
+    if (crew.rows.length === 0) return res.status(404).json({ error: "No crew found" });
+    const cr = crew.rows[0];
+    const members = await pool.query(
+      `SELECT avatar_name, crew_rank FROM ce_crew_members WHERE crew_id=$1 ORDER BY joined_at ASC`, [cr.id]);
+    res.json({
+      crew_name: cr.crew_name, crew_id: cr.id, leader_name: cr.leader_name,
+      vault_balance: cr.vault_balance, cut_pct: cr.cut_pct, total_earned: cr.total_earned,
+      member_count: members.rows.length,
+      members: members.rows,
+      tools: { gloves: cr.gloves_stock, mask: cr.mask_stock, lockpick: cr.lockpick_stock, hacker: cr.hacker_stock, jammer: cr.jammer_stock }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Deposit money into vault (from personal cash_on_hand)
+app.post("/ce/crew/deposit", async (req, res) => {
+  const { avatar_uuid, community_org, amount } = req.body;
+  const amt = parseInt(amount);
+  if (!avatar_uuid || !community_org || !amt || amt <= 0) return res.status(400).json({ error: "Invalid amount" });
+  try {
+    const m = await pool.query(`SELECT crew_id FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    if (m.rows.length === 0) return res.status(404).json({ error: "You are not in a crew" });
+    const r = await pool.query(
+      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand-$1 WHERE avatar_uuid=$2 AND community_org=$3 AND cash_on_hand>=$1 RETURNING cash_on_hand`,
+      [amt, avatar_uuid, community_org]);
+    if (r.rows.length === 0) return res.status(409).json({ error: "Not enough cash on hand" });
+    await pool.query(`UPDATE ce_crews SET vault_balance=vault_balance+$1 WHERE id=$2`, [amt, m.rows[0].crew_id]);
+    res.json({ success: true, deposited: amt, cash_on_hand: r.rows[0].cash_on_hand });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Withdraw money from vault (boss only)
+app.post("/ce/crew/withdraw", async (req, res) => {
+  const { avatar_uuid, community_org, amount } = req.body;
+  const amt = parseInt(amount);
+  if (!avatar_uuid || !community_org || !amt || amt <= 0) return res.status(400).json({ error: "Invalid amount" });
+  try {
+    const m = await pool.query(`SELECT crew_id, crew_rank FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    if (m.rows.length === 0) return res.status(404).json({ error: "You are not in a crew" });
+    if (m.rows[0].crew_rank !== "Boss") return res.status(403).json({ error: "Only the boss can withdraw from the vault" });
+    const r = await pool.query(
+      `UPDATE ce_crews SET vault_balance=vault_balance-$1 WHERE id=$2 AND vault_balance>=$1 RETURNING vault_balance`,
+      [amt, m.rows[0].crew_id]);
+    if (r.rows.length === 0) return res.status(409).json({ error: "Vault does not have that much" });
+    await pool.query(`UPDATE ce_criminals SET cash_on_hand=cash_on_hand+$1 WHERE avatar_uuid=$2 AND community_org=$3`, [amt, avatar_uuid, community_org]);
+    res.json({ success: true, withdrawn: amt, vault_balance: r.rows[0].vault_balance });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Deposit tools into crew locker (from personal uses)
+app.post("/ce/crew/tool/deposit", async (req, res) => {
+  const { avatar_uuid, community_org, tool, qty } = req.body;
+  const n = parseInt(qty) || 1;
+  const valid = ["gloves","mask","lockpick","hacker","jammer"];
+  if (!avatar_uuid || !community_org || valid.indexOf(tool) === -1) return res.status(400).json({ error: "Invalid request" });
+  try {
+    const m = await pool.query(`SELECT crew_id FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    if (m.rows.length === 0) return res.status(404).json({ error: "You are not in a crew" });
+    const col = tool + "_uses";
+    const r = await pool.query(
+      `UPDATE ce_criminals SET ${col}=${col}-$1 WHERE avatar_uuid=$2 AND community_org=$3 AND ${col}>=$1 RETURNING ${col}`,
+      [n, avatar_uuid, community_org]);
+    if (r.rows.length === 0) return res.status(409).json({ error: "You do not have that many " + tool });
+    const scol = tool + "_stock";
+    await pool.query(`UPDATE ce_crews SET ${scol}=${scol}+$1 WHERE id=$2`, [n, m.rows[0].crew_id]);
+    res.json({ success: true, tool: tool, deposited: n });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Take tools from crew locker (any member)
+app.post("/ce/crew/tool/take", async (req, res) => {
+  const { avatar_uuid, community_org, tool, qty } = req.body;
+  const n = parseInt(qty) || 1;
+  const valid = ["gloves","mask","lockpick","hacker","jammer"];
+  if (!avatar_uuid || !community_org || valid.indexOf(tool) === -1) return res.status(400).json({ error: "Invalid request" });
+  try {
+    const m = await pool.query(`SELECT crew_id FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    if (m.rows.length === 0) return res.status(404).json({ error: "You are not in a crew" });
+    const scol = tool + "_stock";
+    const r = await pool.query(
+      `UPDATE ce_crews SET ${scol}=${scol}-$1 WHERE id=$2 AND ${scol}>=$1 RETURNING ${scol}`,
+      [n, m.rows[0].crew_id]);
+    if (r.rows.length === 0) return res.status(409).json({ error: "The locker does not have that many " + tool });
+    const col = tool + "_uses";
+    await pool.query(`UPDATE ce_criminals SET ${col}=${col}+$1 WHERE avatar_uuid=$2 AND community_org=$3`, [n, avatar_uuid, community_org]);
+    res.json({ success: true, tool: tool, taken: n });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Set crew cut % (boss only)
+app.post("/ce/crew/setcut", async (req, res) => {
+  const { avatar_uuid, cut_pct } = req.body;
+  const pct = parseInt(cut_pct);
+  if (!avatar_uuid || isNaN(pct) || pct < 0 || pct > 50) return res.status(400).json({ error: "Cut must be 0-50%" });
+  try {
+    const m = await pool.query(`SELECT crew_id, crew_rank FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    if (m.rows.length === 0 || m.rows[0].crew_rank !== "Boss") return res.status(403).json({ error: "Only the boss sets the cut" });
+    await pool.query(`UPDATE ce_crews SET cut_pct=$1 WHERE id=$2`, [pct, m.rows[0].crew_id]);
+    res.json({ success: true, cut_pct: pct });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — Crime Scene Investigation (PD)
+// ============================================================
+
+// List open scenes for the community (PD HUD board)
+app.get("/ce/scene/open", async (req, res) => {
+  const { org } = req.query;
+  if (!org) return res.status(400).json({ error: "Missing org" });
+  try {
+    const r = await pool.query(
+      `SELECT id, business_name, region, amount_taken, occurred_at FROM ce_crime_scenes
+       WHERE community_org=$1 AND status='open' ORDER BY occurred_at DESC LIMIT 20`, [org]);
+    res.json({ scenes: r.rows, count: r.rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Investigate — PD role only. Returns leads based on what the thief left.
+app.post("/ce/scene/investigate", async (req, res) => {
+  const { register_code, scene_id, officer_uuid, officer_name, community_org } = req.body;
+  if ((!register_code && !scene_id) || !officer_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const off = await pool.query(`SELECT role FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`, [officer_uuid, community_org]);
+    if (off.rows.length === 0 || off.rows[0].role !== "Cop") {
+      return res.status(403).json({ error: "Only PD officers can investigate crime scenes." });
+    }
+    let scene;
+    if (scene_id) {
+      scene = await pool.query(`SELECT * FROM ce_crime_scenes WHERE id=$1 AND status='open'`, [parseInt(scene_id)]);
+    } else {
+      scene = await pool.query(`SELECT * FROM ce_crime_scenes WHERE register_code=$1 AND status='open' ORDER BY occurred_at DESC LIMIT 1`, [register_code]);
+    }
+    if (scene.rows.length === 0) return res.status(404).json({ error: "No open crime scene here." });
+    const sc = scene.rows[0];
+    await pool.query(`UPDATE ce_crime_scenes SET investigated_by=$1 WHERE id=$2`, [officer_name || "Officer", sc.id]);
+
+    let lead = "";
+    let suspect = "";
+    if (sc.prints_left) {
+      suspect = sc.suspect_name;
+      lead = "Fingerprints recovered. Suspect identified: " + sc.suspect_name;
+    } else if (sc.name_known) {
+      suspect = sc.suspect_name;
+      lead = "Witnesses ID the suspect: " + sc.suspect_name;
+    } else {
+      lead = "No prints, no witnesses. This was a professional job — no solid leads.";
+    }
+    res.json({
+      success: true, scene_id: sc.id, business_name: sc.business_name,
+      amount_taken: sc.amount_taken, prints_left: sc.prints_left, name_known: sc.name_known,
+      alarm_sounded: sc.alarm_sounded, lead: lead, suspect: suspect, occurred_at: sc.occurred_at
+    });
+  } catch (err) {
+    console.error("CE investigate error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Clear a scene — PD role only. Closes the case.
+app.post("/ce/scene/clear", async (req, res) => {
+  const { scene_id, register_code, officer_uuid, officer_name, community_org } = req.body;
+  if ((!scene_id && !register_code) || !officer_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
+  try {
+    const off = await pool.query(`SELECT role FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`, [officer_uuid, community_org]);
+    if (off.rows.length === 0 || off.rows[0].role !== "Cop") {
+      return res.status(403).json({ error: "Only PD officers can clear scenes." });
+    }
+    let q;
+    if (scene_id) {
+      q = await pool.query(`UPDATE ce_crime_scenes SET status='cleared', cleared_by=$1, cleared_at=NOW() WHERE id=$2 AND status='open' RETURNING business_name`, [officer_name || "Officer", parseInt(scene_id)]);
+    } else {
+      q = await pool.query(`UPDATE ce_crime_scenes SET status='cleared', cleared_by=$1, cleared_at=NOW() WHERE register_code=$2 AND status='open' RETURNING business_name`, [officer_name || "Officer", register_code]);
+    }
+    if (q.rows.length === 0) return res.status(404).json({ error: "No open scene to clear." });
+    res.json({ success: true, cleared: q.rows[0].business_name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — Player Transfers
+// ============================================================
+app.post("/ce/pay", async (req, res) => {
+  const { from_uuid, to_uuid, to_name, community_org, amount } = req.body;
+  const amt = parseInt(amount);
+  if (!from_uuid || !to_uuid || !community_org || !amt || amt <= 0) return res.status(400).json({ error: "Invalid transfer" });
+  if (from_uuid === to_uuid) return res.status(400).json({ error: "You cannot pay yourself" });
+  try {
+    // Make sure recipient exists in this org
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org)
+       VALUES ($1,$2,$3) ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET avatar_name=COALESCE(EXCLUDED.avatar_name, ce_criminals.avatar_name)`,
+      [to_uuid, to_name || "Recipient", community_org]
+    );
+    // Deduct from sender cash_on_hand only if they have it
+    const d = await pool.query(
+      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand-$1 WHERE avatar_uuid=$2 AND community_org=$3 AND cash_on_hand>=$1 RETURNING cash_on_hand`,
+      [amt, from_uuid, community_org]
+    );
+    if (d.rows.length === 0) return res.status(409).json({ error: "Not enough cash on hand" });
+    const r = await pool.query(
+      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand+$1 WHERE avatar_uuid=$2 AND community_org=$3 RETURNING cash_on_hand`,
+      [amt, to_uuid, community_org]
+    );
+    res.json({ success: true, sent: amt, from_balance: d.rows[0].cash_on_hand, to_balance: r.rows[0].cash_on_hand });
+  } catch (err) {
+    console.error("CE pay error:", err);
     res.status(500).json({ error: err.message });
   }
 });
