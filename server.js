@@ -2192,7 +2192,7 @@ app.get('/ce/inventory', async (req, res) => {
       [uuid, org]
     );
     const criminal = await pool.query(
-      `SELECT heat_level, total_steals, total_fenced, total_earnings, skill_level, bank_balance, cash_on_hand, role, xp, level FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      `SELECT heat_level, total_steals, total_fenced, total_earnings, skill_level, bank_balance, cash_on_hand, role, xp, level, player_type FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
       [uuid, org]
     );
     const st = criminal.rows[0] || null;
@@ -3165,6 +3165,165 @@ app.post("/ce/pay", async (req, res) => {
     res.json({ success: true, sent: amt, from_balance: d.rows[0].cash_on_hand, to_balance: r.rows[0].cash_on_hand });
   } catch (err) {
     console.error("CE pay error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — Player Path (Criminal / Civilian)
+// ============================================================
+app.post("/ce/path/set", async (req, res) => {
+  const { avatar_uuid, avatar_name, community_org, path } = req.body;
+  const valid = ["criminal", "civilian"];
+  if (!avatar_uuid || !community_org || valid.indexOf(path) === -1) return res.status(400).json({ error: "Invalid path" });
+  try {
+    await pool.query(
+      `INSERT INTO ce_criminals (avatar_uuid, avatar_name, community_org, player_type, path_chosen)
+       VALUES ($1,$2,$3,$4,TRUE)
+       ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET player_type=$4, path_chosen=TRUE, avatar_name=COALESCE(EXCLUDED.avatar_name, ce_criminals.avatar_name), last_active=NOW()`,
+      [avatar_uuid, avatar_name || "Player", community_org, path]
+    );
+    res.json({ success: true, path: path });
+  } catch (err) {
+    console.error("CE path set error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/ce/path/get", async (req, res) => {
+  const { uuid, org } = req.query;
+  if (!uuid || !org) return res.status(400).json({ error: "Missing uuid or org" });
+  try {
+    const r = await pool.query(`SELECT player_type, path_chosen FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`, [uuid, org]);
+    if (r.rows.length === 0) return res.json({ path: "", chosen: false });
+    res.json({ path: r.rows[0].player_type || "", chosen: r.rows[0].path_chosen === true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — HUD Screen Renderer (thin-client)
+// Returns ready-to-paint ASCII for each app screen.
+// ============================================================
+function ceComma(n) {
+  n = parseInt(n) || 0;
+  let str = String(n);
+  let out = "";
+  let count = 0;
+  for (let i = str.length - 1; i >= 0; i--) {
+    out = str[i] + out;
+    count++;
+    if (count % 3 === 0 && i !== 0) out = "," + out;
+  }
+  return out;
+}
+function ceRankName(level) {
+  const ranks = ["Street Rat","Petty Thief","Hustler","Runner","Enforcer","Racketeer","Capo","Underboss","Boss","Kingpin"];
+  let idx = Math.floor(((parseInt(level)||1) - 1) / 10);
+  if (idx < 0) idx = 0; if (idx > 9) idx = 9;
+  return ranks[idx];
+}
+
+app.get("/ce/hud/screen", async (req, res) => {
+  const { app: appName, uuid, org } = req.query;
+  if (!appName || !uuid || !org) return res.status(400).json({ error: "Missing app, uuid, or org" });
+  try {
+    const cr = await pool.query(
+      `SELECT avatar_name, heat_level, total_steals, total_fenced, total_earnings, bank_balance, cash_on_hand, xp, level, role, gloves_uses, mask_uses, lockpick_uses, hacker_uses, jammer_uses FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [uuid, org]
+    );
+    const c = cr.rows[0] || {};
+    const CUR = "\u20a1"; // colon currency symbol
+    let text = "";
+
+    if (appName === "bank") {
+      text = "= = = = = = = = = =\n"
+           + "  " + CUR + " " + ceComma(c.bank_balance) + "\n"
+           + "TOTAL BALANCE\n"
+           + "------------------\n"
+           + "CASH  " + CUR + ceComma(c.cash_on_hand) + "\n"
+           + "EARN  " + CUR + ceComma(c.total_earnings) + "\n"
+           + "= = = = = = = = = =";
+    }
+    else if (appName === "profile") {
+      const lvl = parseInt(c.level) || 1;
+      const nextXp = (lvl + 1) * (lvl + 1) * 25;
+      text = "= = = = = = = = = =\n"
+           + (c.avatar_name || "Unknown") + "\n"
+           + "[ " + ceRankName(lvl) + " ]\n"
+           + "------------------\n"
+           + "LVL " + lvl + " / 100\n"
+           + "XP " + ceComma(c.xp) + " / " + ceComma(nextXp) + "\n"
+           + "STEALS " + (c.total_steals||0) + "  FENCED " + (c.total_fenced||0) + "\n"
+           + "HEAT " + (c.heat_level||0) + " / 10\n"
+           + "= = = = = = = = = =";
+    }
+    else if (appName === "stash") {
+      const items = await pool.query(
+        `SELECT item_name, base_value FROM ce_items WHERE stolen_by_uuid=$1 AND community_org=$2 AND status='stolen' ORDER BY stolen_at DESC LIMIT 8`,
+        [uuid, org]
+      );
+      text = "= = = = STASH = = = =\n";
+      if (items.rows.length === 0) {
+        text += "\nEmpty.\nGo steal something.\n";
+      } else {
+        for (let i = 0; i < items.rows.length; i++) {
+          let nm = items.rows[i].item_name || "Item";
+          if (nm.length > 14) nm = nm.substring(0, 14);
+          text += nm + "  " + CUR + ceComma(items.rows[i].base_value) + "\n";
+        }
+      }
+      text += "= = = = = = = = = =";
+    }
+    else if (appName === "accessories") {
+      text = "= = TOOLKIT = =\n"
+           + "Gloves    " + (c.gloves_uses||0) + "\n"
+           + "Mask      " + (c.mask_uses||0) + "\n"
+           + "Lockpick  " + (c.lockpick_uses||0) + "\n"
+           + "Hacker    " + (c.hacker_uses||0) + "\n"
+           + "Jammer    " + (c.jammer_uses||0) + "\n"
+           + "= = = = = = = =\n"
+           + "Auto-used on crimes";
+    }
+    else if (appName === "crew") {
+      const crew = await pool.query(
+        `SELECT cw.crew_name, cw.vault_balance, cw.cut_pct,
+                (SELECT COUNT(*) FROM ce_crew_members WHERE crew_id=cw.id) AS members
+         FROM ce_crews cw JOIN ce_crew_members cm ON cm.crew_id=cw.id
+         WHERE cm.avatar_uuid=$1`, [uuid]
+      );
+      if (crew.rows.length === 0) {
+        text = "= = = CREW = = =\n\nYou are not in a crew.\nTouch a Crew Safe to join.\n= = = = = = = =";
+      } else {
+        const cw = crew.rows[0];
+        text = "= = = = = = = = = =\n"
+             + cw.crew_name + "\n"
+             + "------------------\n"
+             + "VAULT  " + CUR + ceComma(cw.vault_balance) + "\n"
+             + "CUT    " + cw.cut_pct + "%\n"
+             + "CREW   " + cw.members + " members\n"
+             + "= = = = = = = = = =";
+      }
+    }
+    else if (appName === "business") {
+      text = "= = BUSINESS = =\n\nEMPIRE CONTROLS\nComing soon.\n\nManage fronts, pillars,\nand rackets here.\n= = = = = = = =";
+    }
+    else if (appName === "territory") {
+      text = "= = TERRITORY = =\n\nTURF CONTROL\nComing soon.\n\nClaim and defend\nyour zones.\n= = = = = = = =";
+    }
+    else if (appName === "pay") {
+      text = "= = = PAY = = =\n\nCASH  " + CUR + ceComma(c.cash_on_hand) + "\n\nScan nearby, pick a\nperson, pick amount.\n= = = = = = =";
+    }
+    else {
+      text = "Unknown screen.";
+    }
+
+    res.json({ success: true, app: appName, text: text, heat: c.heat_level || 0, player_type: c.player_type || "" });
+  } catch (err) {
+    console.error("CE hud screen error:", err);
     res.status(500).json({ error: err.message });
   }
 });
