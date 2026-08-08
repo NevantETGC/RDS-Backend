@@ -2540,13 +2540,13 @@ app.post("/ce/till/register", async (req, res) => {
       [stats.license_fee, community_org]);
 
     await pool.query(
-      `INSERT INTO ce_registers (register_code, business_name, owner_uuid, owner_name, community_org, region, fill_rate, max_balance, min_rob_level, license_paid, license_fee, tier)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$11)
+      `INSERT INTO ce_registers (register_code, business_name, owner_uuid, owner_name, community_org, region, fill_rate, max_balance, min_rob_level, license_paid, license_fee)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10)
        ON CONFLICT (register_code) DO UPDATE SET
          business_name=$2, owner_uuid=$3, owner_name=$4, community_org=$5, region=$6,
-         fill_rate=$7, max_balance=$8, min_rob_level=$9, license_paid=TRUE, license_fee=$10, tier=$11`,
+         fill_rate=$7, max_balance=$8, min_rob_level=$9, license_paid=TRUE, license_fee=$10`,
       [register_code, business_name || "Business", owner_uuid, owner_name || "", community_org, region || "",
-       stats.fill_rate, stats.max_balance, stats.min_rob_level, stats.license_fee, lvl]
+       stats.fill_rate, stats.max_balance, stats.min_rob_level, stats.license_fee]
     );
     res.json({ success: true, register_code, licensed: true, level: lvl,
       fee_charged: stats.license_fee, remaining_bank: bank - stats.license_fee,
@@ -3232,61 +3232,63 @@ app.get("/ce/hud/screen", async (req, res) => {
   if (!appName || !uuid || !org) return res.status(400).json({ error: "Missing app, uuid, or org" });
   try {
     const cr = await pool.query(
-      `SELECT avatar_name, heat_level, total_steals, total_fenced, total_earnings, bank_balance, cash_on_hand, xp, level, role, gloves_uses, mask_uses, lockpick_uses, hacker_uses, jammer_uses FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      `SELECT avatar_name, heat_level, total_steals, total_fenced, total_earnings, bank_balance, cash_on_hand, xp, level, role, player_type, gloves_uses, mask_uses, lockpick_uses, hacker_uses, jammer_uses FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
       [uuid, org]
     );
     const c = cr.rows[0] || {};
-    const CUR = "\u20a1"; // colon currency symbol
+    const CUR = "\u20a1";
+    const TOP = "\u259b\u2580\u2580\u2580\u2580\u2580\u2580\u2580\u2580\u2580\u2580\u259c";
+    const BOT = "\u2599\u2584\u2584\u2584\u2584\u2584\u2584\u2584\u2584\u2584\u2584\u259f";
+    const D = TOP;
     let text = "";
 
     if (appName === "bank") {
-      text = "= = = = = = = = = =\n"
-           + "  " + CUR + " " + ceComma(c.bank_balance) + "\n"
-           + "TOTAL BALANCE\n"
-           + "------------------\n"
-           + "CASH  " + CUR + ceComma(c.cash_on_hand) + "\n"
-           + "EARN  " + CUR + ceComma(c.total_earnings) + "\n"
-           + "= = = = = = = = = =";
+      text = D + "\n\n"
+           + "   " + CUR + " " + ceComma(c.bank_balance) + "\n"
+           + "   TOTAL BALANCE\n\n"
+           + "   CASH   " + CUR + ceComma(c.cash_on_hand) + "\n"
+           + "   EARN   " + CUR + ceComma(c.total_earnings) + "\n\n"
+           + BOT;
     }
     else if (appName === "profile") {
       const lvl = parseInt(c.level) || 1;
       const nextXp = (lvl + 1) * (lvl + 1) * 25;
-      text = "= = = = = = = = = =\n"
-           + (c.avatar_name || "Unknown") + "\n"
-           + "[ " + ceRankName(lvl) + " ]\n"
-           + "------------------\n"
-           + "LVL " + lvl + " / 100\n"
-           + "XP " + ceComma(c.xp) + " / " + ceComma(nextXp) + "\n"
-           + "STEALS " + (c.total_steals||0) + "  FENCED " + (c.total_fenced||0) + "\n"
-           + "HEAT " + (c.heat_level||0) + " / 10\n"
-           + "= = = = = = = = = =";
+      text = D + "\n\n"
+           + "   " + (c.avatar_name || "Unknown") + "\n"
+           + "   [ " + ceRankName(lvl) + " ]\n\n"
+           + "   LVL   " + lvl + " / 100\n"
+           + "   XP    " + ceComma(c.xp) + " / " + ceComma(nextXp) + "\n\n"
+           + "   STEALS " + (c.total_steals||0) + "   FENCED " + (c.total_fenced||0) + "\n"
+           + "   HEAT   " + (c.heat_level||0) + " / 10\n\n"
+           + BOT;
     }
     else if (appName === "stash") {
       const items = await pool.query(
         `SELECT item_name, base_value FROM ce_items WHERE stolen_by_uuid=$1 AND community_org=$2 AND status='stolen' ORDER BY stolen_at DESC LIMIT 8`,
         [uuid, org]
       );
-      text = "= = = = STASH = = = =\n";
+      text = D + "\n\n";
       if (items.rows.length === 0) {
-        text += "\nEmpty.\nGo steal something.\n";
+        text += "   Empty.\n   Go steal something.\n\n";
       } else {
         for (let i = 0; i < items.rows.length; i++) {
           let nm = items.rows[i].item_name || "Item";
           if (nm.length > 14) nm = nm.substring(0, 14);
-          text += nm + "  " + CUR + ceComma(items.rows[i].base_value) + "\n";
+          text += "   " + nm + "   " + CUR + ceComma(items.rows[i].base_value) + "\n";
         }
+        text += "\n";
       }
-      text += "= = = = = = = = = =";
+      text += D;
     }
     else if (appName === "accessories") {
-      text = "= = TOOLKIT = =\n"
-           + "Gloves    " + (c.gloves_uses||0) + "\n"
-           + "Mask      " + (c.mask_uses||0) + "\n"
-           + "Lockpick  " + (c.lockpick_uses||0) + "\n"
-           + "Hacker    " + (c.hacker_uses||0) + "\n"
-           + "Jammer    " + (c.jammer_uses||0) + "\n"
-           + "= = = = = = = =\n"
-           + "Auto-used on crimes";
+      text = D + "\n\n"
+           + "   GLOVES     " + (c.gloves_uses||0) + "\n"
+           + "   MASK       " + (c.mask_uses||0) + "\n"
+           + "   LOCKPICK   " + (c.lockpick_uses||0) + "\n"
+           + "   HACKER     " + (c.hacker_uses||0) + "\n"
+           + "   JAMMER     " + (c.jammer_uses||0) + "\n\n"
+           + "   Auto-used on crimes\n\n"
+           + BOT;
     }
     else if (appName === "crew") {
       const crew = await pool.query(
@@ -3296,26 +3298,59 @@ app.get("/ce/hud/screen", async (req, res) => {
          WHERE cm.avatar_uuid=$1`, [uuid]
       );
       if (crew.rows.length === 0) {
-        text = "= = = CREW = = =\n\nYou are not in a crew.\nTouch a Crew Safe to join.\n= = = = = = = =";
+        text = D + "\n\n   You are not in a crew.\n   Touch a Crew Safe\n   to join.\n\n" + BOT;
       } else {
         const cw = crew.rows[0];
-        text = "= = = = = = = = = =\n"
-             + cw.crew_name + "\n"
-             + "------------------\n"
-             + "VAULT  " + CUR + ceComma(cw.vault_balance) + "\n"
-             + "CUT    " + cw.cut_pct + "%\n"
-             + "CREW   " + cw.members + " members\n"
-             + "= = = = = = = = = =";
+        text = D + "\n\n"
+             + "   " + cw.crew_name + "\n\n"
+             + "   VAULT   " + CUR + ceComma(cw.vault_balance) + "\n"
+             + "   CUT     " + cw.cut_pct + "%\n"
+             + "   CREW    " + cw.members + " members\n\n"
+             + BOT;
       }
     }
     else if (appName === "business") {
-      text = "= = BUSINESS = =\n\nEMPIRE CONTROLS\nComing soon.\n\nManage fronts, pillars,\nand rackets here.\n= = = = = = = =";
+      text = D + "\n\n   EMPIRE CONTROLS\n   Coming soon.\n\n   Fronts, pillars,\n   and rackets.\n\n" + BOT;
     }
     else if (appName === "territory") {
-      text = "= = TERRITORY = =\n\nTURF CONTROL\nComing soon.\n\nClaim and defend\nyour zones.\n= = = = = = = =";
+      text = D + "\n\n   TURF CONTROL\n   Coming soon.\n\n   Claim and defend\n   your zones.\n\n" + BOT;
+    }
+    else if (appName === "wallet") {
+      text = D + "\n\n"
+           + "   " + CUR + " " + ceComma(c.bank_balance) + "\n"
+           + "   BALANCE\n\n"
+           + "   CASH   " + CUR + ceComma(c.cash_on_hand) + "\n\n"
+           + D;
+    }
+    else if (appName === "jobs") {
+      let jt = D + "\n\n   YOUR CAREERS\n\n";
+      let any = false;
+      if (c.is_business_owner) { jt += "   Business Owner  ON\n"; any = true; }
+      if (c.is_homeowner)      { jt += "   Homeowner       ON\n"; any = true; }
+      if (c.is_police)         { jt += "   Police          ON\n"; any = true; }
+      if (c.is_doctor)         { jt += "   Doctor          ON\n"; any = true; }
+      if (c.is_mechanic)       { jt += "   Mechanic         ON\n"; any = true; }
+      if (!any) jt += "   No professions yet.\n";
+      jt += "\n   Own a shop, house,\n   or get certified\n   to unlock apps.\n\n" + D;
+      text = jt;
+    }
+    else if (appName === "police") {
+      const scenes = await pool.query(
+        `SELECT COUNT(*) AS open FROM ce_crime_scenes WHERE community_org=$1 AND status='open'`, [org]);
+      const openCount = scenes.rows[0] ? scenes.rows[0].open : 0;
+      text = D + "\n\n   POLICE\n\n   Open cases: " + openCount + "\n\n   Touch a robbed\n   register to\n   investigate.\n\n" + D;
+    }
+    else if (appName === "doctor") {
+      text = D + "\n\n   DOCTOR\n\n   Med XP: " + ceComma(c.doctor_xp) + "\n\n   Scan nearby to\n   heal the injured.\n\n" + D;
+    }
+    else if (appName === "mechanic") {
+      text = D + "\n\n   MECHANIC\n\n   Repair XP: " + ceComma(c.mechanic_xp) + "\n\n   Scan nearby for\n   damaged buildings\n   to repair.\n\n" + D;
+    }
+    else if (appName === "civbusiness") {
+      text = D + "\n\n   BUSINESS\n\n   Manage your shops,\n   collect earnings.\n\n   Use your register\n   in-world.\n\n" + D;
     }
     else if (appName === "pay") {
-      text = "= = = PAY = = =\n\nCASH  " + CUR + ceComma(c.cash_on_hand) + "\n\nScan nearby, pick a\nperson, pick amount.\n= = = = = = =";
+      text = D + "\n\n   CASH   " + CUR + ceComma(c.cash_on_hand) + "\n\n   Scan nearby, pick\n   a person, pick\n   an amount.\n\n" + BOT;
     }
     else {
       text = "Unknown screen.";
@@ -3327,6 +3362,603 @@ app.get("/ce/hud/screen", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
+// ============================================================
+// CRIMINAL EMPIRES — Professions (civilian)
+// ============================================================
+app.get("/ce/professions/get", async (req, res) => {
+  const { uuid, org } = req.query;
+  if (!uuid || !org) return res.status(400).json({ error: "Missing uuid or org" });
+  try {
+    const r = await pool.query(
+      `SELECT is_business_owner, is_homeowner, is_police, is_doctor, is_mechanic, player_type, path_locked FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [uuid, org]);
+    if (r.rows.length === 0) return res.json({ professions: [], player_type: "", locked: false });
+    const c = r.rows[0];
+    let profs = [];
+    if (c.is_business_owner) profs.push("business");
+    if (c.is_homeowner) profs.push("homeowner");
+    if (c.is_police) profs.push("police");
+    if (c.is_doctor) profs.push("doctor");
+    if (c.is_mechanic) profs.push("mechanic");
+    res.json({ professions: profs, player_type: c.player_type || "", locked: c.path_locked === true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Grant a profession (called when a player qualifies)
+app.post("/ce/professions/grant", async (req, res) => {
+  const { avatar_uuid, community_org, profession } = req.body;
+  const cols = { business: "is_business_owner", homeowner: "is_homeowner", police: "is_police", doctor: "is_doctor", mechanic: "is_mechanic" };
+  if (!avatar_uuid || !community_org || !cols[profession]) return res.status(400).json({ error: "Invalid profession" });
+  try {
+    await pool.query(`UPDATE ce_criminals SET ${cols[profession]}=TRUE WHERE avatar_uuid=$1 AND community_org=$2`, [avatar_uuid, community_org]);
+    res.json({ success: true, profession: profession });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// CRIMINAL EMPIRES — JOBS SYSTEM (station-gated, HUD-driven)
+// ============================================================
+app.post("/ce/job/station/register", async (req, res) => {
+  const { station_code, job_type, mode, community_org, owner_uuid, owner_name, region, pos_x, pos_y, pos_z } = req.body;
+  const types = ["police", "doctor", "mechanic"];
+  if (!station_code || !community_org || types.indexOf(job_type) === -1) return res.status(400).json({ error: "Invalid station params" });
+  const m = (mode === "stationed") ? "stationed" : "patrol";
+  try {
+    await pool.query(
+      `INSERT INTO ce_job_stations (station_code, job_type, mode, community_org, owner_uuid, owner_name, region, pos_x, pos_y, pos_z, last_seen)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+       ON CONFLICT (station_code) DO UPDATE SET job_type=$2, mode=$3, community_org=$4, owner_uuid=$5, owner_name=$6, region=$7, pos_x=$8, pos_y=$9, pos_z=$10, last_seen=NOW()`,
+      [station_code, job_type, m, community_org, owner_uuid || null, owner_name || null, region || null, pos_x || null, pos_y || null, pos_z || null]
+    );
+    res.json({ success: true, station_code: station_code, job_type: job_type, mode: m });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/ce/job/onduty", async (req, res) => {
+  const { avatar_uuid, avatar_name, community_org, job_type, station_code } = req.body;
+  const flagCol = { police: "is_police", doctor: "is_doctor", mechanic: "is_mechanic" };
+  if (!avatar_uuid || !community_org || !flagCol[job_type]) return res.status(400).json({ error: "Invalid job params" });
+  try {
+    const pr = await pool.query(
+      `SELECT ${flagCol[job_type]} AS ok FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [avatar_uuid, community_org]);
+    if (pr.rows.length === 0 || pr.rows[0].ok !== true) return res.status(403).json({ error: "You are not certified for this job." });
+    const ex = await pool.query(
+      `SELECT id, xp_earned FROM ce_job_shifts WHERE avatar_uuid=$1 AND community_org=$2 AND status=$3`,
+      [avatar_uuid, community_org, "active"]);
+    if (ex.rows.length > 0) return res.json({ success: true, already: true, shift_id: ex.rows[0].id, job_type: job_type });
+    const ins = await pool.query(
+      `INSERT INTO ce_job_shifts (avatar_uuid, avatar_name, community_org, job_type, station_code, status, last_tick)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING id`,
+      [avatar_uuid, avatar_name || null, community_org, job_type, station_code || null, "active"]);
+    res.json({ success: true, shift_id: ins.rows[0].id, job_type: job_type });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/ce/job/offduty", async (req, res) => {
+  const { avatar_uuid, community_org } = req.body;
+  if (!avatar_uuid || !community_org) return res.status(400).json({ error: "Missing uuid or org" });
+  try {
+    const r = await pool.query(
+      `UPDATE ce_job_shifts SET status=$3, ended_at=NOW() WHERE avatar_uuid=$1 AND community_org=$2 AND status=$4 RETURNING job_type, xp_earned`,
+      [avatar_uuid, community_org, "ended", "active"]);
+    if (r.rows.length === 0) return res.json({ success: true, on_duty: false, xp_earned: 0 });
+    res.json({ success: true, off: true, job_type: r.rows[0].job_type, xp_earned: r.rows[0].xp_earned });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/ce/job/earn", async (req, res) => {
+  const { avatar_uuid, community_org } = req.body;
+  const xpCol = { police: "police_xp", doctor: "doctor_xp", mechanic: "mechanic_xp" };
+  const JOB_XP = 10;
+  const MIN_SECS = 590;
+  if (!avatar_uuid || !community_org) return res.status(400).json({ error: "Missing uuid or org" });
+  try {
+    const sh = await pool.query(
+      `SELECT id, job_type, EXTRACT(EPOCH FROM (NOW() - last_tick)) AS since FROM ce_job_shifts WHERE avatar_uuid=$1 AND community_org=$2 AND status=$3`,
+      [avatar_uuid, community_org, "active"]);
+    if (sh.rows.length === 0) return res.json({ success: true, on_duty: false, awarded: 0 });
+    const shift = sh.rows[0];
+    if (parseFloat(shift.since) < MIN_SECS) return res.json({ success: true, on_duty: true, awarded: 0, throttled: true, since: Math.floor(shift.since), job_type: shift.job_type });
+    const col = xpCol[shift.job_type];
+    if (!col) return res.status(400).json({ error: "Bad job type on shift" });
+    await pool.query(`UPDATE ce_job_shifts SET xp_earned = xp_earned + $2, last_tick = NOW() WHERE id=$1`, [shift.id, JOB_XP]);
+    const up = await pool.query(
+      `UPDATE ce_criminals SET ${col} = COALESCE(${col},0) + $3 WHERE avatar_uuid=$1 AND community_org=$2 RETURNING ${col} AS total`,
+      [avatar_uuid, community_org, JOB_XP]);
+    const total = up.rows.length ? up.rows[0].total : 0;
+    res.json({ success: true, on_duty: true, awarded: JOB_XP, total_xp: total, job_type: shift.job_type });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/ce/job/status", async (req, res) => {
+  const { uuid, org } = req.query;
+  if (!uuid || !org) return res.status(400).json({ error: "Missing uuid or org" });
+  try {
+    const r = await pool.query(
+      `SELECT job_type, station_code, xp_earned, started_at FROM ce_job_shifts WHERE avatar_uuid=$1 AND community_org=$2 AND status=$3`,
+      [uuid, org, "active"]);
+    if (r.rows.length === 0) return res.json({ on_duty: false });
+    res.json({ on_duty: true, job_type: r.rows[0].job_type, station_code: r.rows[0].station_code, xp_earned: r.rows[0].xp_earned, started_at: r.rows[0].started_at });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — Job certification (touch a station to join)
+// ============================================================
+app.post("/ce/job/certify", async (req, res) => {
+  const { avatar_uuid, avatar_name, community_org, job_type } = req.body;
+  const flagCol = { police: "is_police", doctor: "is_doctor", mechanic: "is_mechanic" };
+  if (!avatar_uuid || !community_org || !flagCol[job_type]) return res.status(400).json({ error: "Invalid certify params" });
+  try {
+    const r = await pool.query(
+      `SELECT player_type, ${flagCol[job_type]} AS has FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [avatar_uuid, community_org]);
+    if (r.rows.length === 0 || !r.rows[0].player_type || r.rows[0].player_type === "") {
+      return res.json({ status: "no_path" });
+    }
+    if (r.rows[0].player_type === "criminal") {
+      return res.json({ status: "criminal_blocked" });
+    }
+    if (r.rows[0].has === true) {
+      return res.json({ status: "already", profession: job_type });
+    }
+    await pool.query(`UPDATE ce_criminals SET ${flagCol[job_type]}=TRUE WHERE avatar_uuid=$1 AND community_org=$2`, [avatar_uuid, community_org]);
+    res.json({ status: "granted", profession: job_type });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — BUILDING TIERS + AUTO-UPGRADE
+// ============================================================
+var CE_TIERS = {
+  1: { name: "Shop",      max_hp: 100, max_balance: 500,   fill_rate: 25 },
+  2: { name: "Warehouse", max_hp: 250, max_balance: 2500,  fill_rate: 60 },
+  3: { name: "Hideout",   max_hp: 400, max_balance: 7500,  fill_rate: 130 },
+  4: { name: "HQ",        max_hp: 600, max_balance: 20000, fill_rate: 250 }
+};
+var CE_GATES = {
+  2: { level: 21, bank: 25000 },
+  3: { level: 51, bank: 100000 },
+  4: { level: 81, bank: 500000 }
+};
+
+app.get("/ce/building/status", async (req, res) => {
+  const { code, org } = req.query;
+  if (!code || !org) return res.status(400).json({ error: "Missing code or org" });
+  try {
+    const q = await pool.query(
+      `SELECT r.tier, r.balance, r.max_balance, r.fill_rate, r.owner_uuid, r.business_name, r.structure_code,
+              s.hp, s.max_hp, s.status
+       FROM ce_registers r
+       LEFT JOIN ce_structures s ON r.structure_code = s.structure_code
+       WHERE r.register_code=$1 AND r.community_org=$2`,
+      [code, org]);
+    if (q.rows.length === 0) return res.status(404).json({ error: "Register not found" });
+    const r = q.rows[0];
+    let curTier = r.tier || 1;
+    if (!CE_TIERS[curTier]) curTier = 1;
+    let next = null;
+    if (curTier < 4) {
+      const g = CE_GATES[curTier + 1];
+      next = { tier: curTier + 1, name: CE_TIERS[curTier + 1].name, need_level: g.level, need_bank: g.bank };
+    }
+    res.json({
+      business_name: r.business_name, tier: curTier, tier_name: CE_TIERS[curTier].name,
+      hp: r.hp, max_hp: r.max_hp, status: r.status,
+      balance: r.balance, max_balance: r.max_balance, fill_rate: r.fill_rate, next: next
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/ce/building/upgrade", async (req, res) => {
+  const { register_code, community_org } = req.body;
+  if (!register_code || !community_org) return res.status(400).json({ error: "Missing register_code or org" });
+  try {
+    const reg = await pool.query(
+      `SELECT tier, owner_uuid, structure_code, business_name FROM ce_registers WHERE register_code=$1 AND community_org=$2`,
+      [register_code, community_org]);
+    if (reg.rows.length === 0) return res.status(404).json({ error: "Register not found" });
+    const r = reg.rows[0];
+    let curTier = r.tier || 1;
+    if (!CE_TIERS[curTier]) curTier = 1;
+    if (curTier >= 4) return res.json({ upgraded: false, maxed: true, tier: 4, tier_name: "HQ" });
+    const nextTier = curTier + 1;
+    const gate = CE_GATES[nextTier];
+    const own = await pool.query(
+      `SELECT level, bank_balance FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [r.owner_uuid, community_org]);
+    if (own.rows.length === 0) return res.status(404).json({ error: "Owner not found" });
+    const lvl = own.rows[0].level || 1;
+    const bank = own.rows[0].bank_balance || 0;
+    if (lvl < gate.level || bank < gate.bank) {
+      return res.json({
+        upgraded: false, tier: curTier, tier_name: CE_TIERS[curTier].name,
+        next_tier: nextTier, next_name: CE_TIERS[nextTier].name,
+        need_level: gate.level, have_level: lvl, need_bank: gate.bank, have_bank: bank
+      });
+    }
+    const t = CE_TIERS[nextTier];
+    await pool.query(
+      `UPDATE ce_registers SET tier=$2, max_balance=$3, fill_rate=$4 WHERE register_code=$1`,
+      [register_code, nextTier, t.max_balance, t.fill_rate]);
+    if (r.structure_code) {
+      await pool.query(
+        `UPDATE ce_structures SET tier=$2, hp=LEAST(hp + ($3 - max_hp), $3), max_hp=$3 WHERE structure_code=$1`,
+        [r.structure_code, nextTier, t.max_hp]);
+    }
+    res.json({ upgraded: true, tier: nextTier, tier_name: t.name, max_hp: t.max_hp, max_balance: t.max_balance, fill_rate: t.fill_rate });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — DAMAGE LAYER
+// ============================================================
+// Eligibility: owner must have >= CE_DAMAGE_MIN_BANK to be targetable (anti-grief)
+var CE_DAMAGE_MIN_BANK = 20000;
+
+app.post("/ce/building/damage", async (req, res) => {
+  const { register_code, community_org, attacker_uuid, attacker_name, amount } = req.body;
+  if (!register_code || !community_org) return res.status(400).json({ error: "Missing register_code or org" });
+  let hit = parseInt(amount, 10);
+  if (isNaN(hit) || hit <= 0) hit = 5 + Math.floor(Math.random() * 11); // 5-15
+  try {
+    const reg = await pool.query(
+      `SELECT tier, owner_uuid, owner_name, business_name, structure_code, region, balance FROM ce_registers WHERE register_code=$1 AND community_org=$2`,
+      [register_code, community_org]);
+    if (reg.rows.length === 0) return res.status(404).json({ error: "Register not found" });
+    const r = reg.rows[0];
+    let curTier = r.tier || 1;
+    if (!CE_TIERS[curTier]) curTier = 1;
+
+    // Owner eligibility (anti-grief): must have capital to lose
+    const own = await pool.query(
+      `SELECT bank_balance FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [r.owner_uuid, community_org]);
+    const ownerBank = (own.rows.length > 0 && own.rows[0].bank_balance) ? own.rows[0].bank_balance : 0;
+    if (ownerBank < CE_DAMAGE_MIN_BANK) {
+      return res.json({ damaged: false, protected: true, reason: "Owner has too little to lose. Not targetable yet." });
+    }
+
+    // Lazy-init structure if the register never had one
+    let scode = r.structure_code;
+    const maxhp = CE_TIERS[curTier].max_hp;
+    if (!scode || scode === "") {
+      scode = register_code; // reuse the register code as the structure key
+      await pool.query(
+        `INSERT INTO ce_structures (structure_code, structure_name, structure_type, owner_uuid, owner_name, community_org, region, hp, max_hp, tier, status)
+         VALUES ($1,$2,'business',$3,$4,$5,$6,$7,$7,$8,'operational')
+         ON CONFLICT (structure_code) DO NOTHING`,
+        [scode, r.business_name, r.owner_uuid, r.owner_name, community_org, r.region, maxhp, curTier]);
+      await pool.query(`UPDATE ce_registers SET structure_code=$1 WHERE register_code=$2`, [scode, register_code]);
+    }
+
+    // Apply damage
+    const upd = await pool.query(
+      `UPDATE ce_structures
+       SET hp = GREATEST(hp - $2, 0),
+           damaged_by_uuid = $3, damaged_by_name = $4, last_damaged = NOW(),
+           status = CASE WHEN GREATEST(hp - $2, 0) = 0 THEN 'destroyed' ELSE 'operational' END
+       WHERE structure_code = $1
+       RETURNING hp, max_hp`,
+      [scode, hit, attacker_uuid || null, attacker_name || null]);
+    if (upd.rows.length === 0) return res.status(500).json({ error: "Structure update failed" });
+    const hp = upd.rows[0].hp;
+
+    // Tier effects: burn money based on HP band
+    let tillBurn = 0;
+    let bankBurn = 0;
+    let band = "healthy";
+    const pct = (hp / maxhp) * 100;
+    if (hp === 0) {
+      band = "destroyed";
+      tillBurn = Math.floor(r.balance * 0.20);
+      bankBurn = Math.floor(ownerBank * 0.05);
+    } else if (pct < 30) {
+      band = "critical";
+      tillBurn = Math.floor(r.balance * 0.15);
+      bankBurn = Math.floor(ownerBank * 0.03);
+    } else if (pct < 70) {
+      band = "damaged";
+      tillBurn = Math.floor(r.balance * 0.10);
+      bankBurn = Math.floor(ownerBank * 0.01);
+    } else {
+      band = "healthy";
+      bankBurn = Math.floor(ownerBank * 0.005);
+    }
+    if (tillBurn > 0) {
+      await pool.query(`UPDATE ce_registers SET balance = GREATEST(balance - $2, 0) WHERE register_code=$1`, [register_code, tillBurn]);
+    }
+    if (bankBurn > 0) {
+      await pool.query(`UPDATE ce_criminals SET bank_balance = GREATEST(bank_balance - $3, 0) WHERE avatar_uuid=$1 AND community_org=$2`, [r.owner_uuid, community_org, bankBurn]);
+    }
+
+    // --- SIEGE ATTRIBUTION ---
+    let attackerCrew = null;
+    if (attacker_uuid && attacker_uuid !== "fire" && attacker_uuid !== "smoke") {
+      try {
+        let ac = await pool.query("SELECT crew_id FROM ce_crew_members WHERE avatar_uuid=$1 LIMIT 1", [attacker_uuid]);
+        if (ac.rows.length === 0 || !ac.rows[0].crew_id) { ac = await pool.query("SELECT id AS crew_id FROM ce_crews WHERE leader_uuid=$1 AND community_org=$2 LIMIT 1", [attacker_uuid, community_org]); }
+        if (ac.rows.length > 0) attackerCrew = ac.rows[0].crew_id;
+        if (!attackerCrew) { const al = await pool.query("SELECT id FROM ce_crews WHERE leader_uuid=$1 AND community_org=$2 LIMIT 1", [attacker_uuid, community_org]); if (al.rows.length > 0) attackerCrew = al.rows[0].id; }
+      } catch (e) {}
+    }
+    try {
+      await pool.query("INSERT INTO ce_building_damage_log (structure_code, register_code, community_org, attacker_uuid, attacker_crew_id, damage) VALUES ($1,$2,$3,$4,$5,$6)", [scode, register_code, community_org, attacker_uuid || null, attackerCrew, hit]);
+      await pool.query("UPDATE ce_sieges SET last_attacker_seen=NOW(), hit_zero_at = CASE WHEN $2 = 0 AND hit_zero_at IS NULL THEN NOW() ELSE hit_zero_at END, forfeiture_deadline = CASE WHEN $2 = 0 AND forfeiture_deadline IS NULL THEN NOW() + INTERVAL $3 ELSE forfeiture_deadline END WHERE register_code=$1 AND status=$4", [register_code, hp, "3 days", "active"]);
+    } catch (e) {}
+    res.json({
+      damaged: true, hp: hp, max_hp: maxhp, band: band,
+      dealt: hit, till_lost: tillBurn, bank_lost: bankBurn,
+      business_name: r.business_name
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ============================================================
+// CRIMINAL EMPIRES — RECOVERY + MECHANIC REPAIR
+// ============================================================
+// ============================================================
+// CE REPAIR v2 — mechanic sets it off, cron heals over time
+// ============================================================
+function ceRepairRate(mxp) {
+  if (mxp >= 5000) return 25;   // master — ~destroyed to full in ~20 min (5min ticks)
+  if (mxp >= 2000) return 15;
+  if (mxp >= 500)  return 8;
+  if (mxp >= 100)  return 5;
+  return 3;                      // novice — slow
+}
+
+app.post("/ce/building/repair", async (req, res) => {
+  const { register_code, community_org, mechanic_uuid, mechanic_name } = req.body;
+  if (!register_code || !community_org || !mechanic_uuid) return res.status(400).json({ error: "Missing register_code, org, or mechanic_uuid" });
+  try {
+    const mech = await pool.query(
+      `SELECT is_mechanic, mechanic_xp FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [mechanic_uuid, community_org]);
+    if (mech.rows.length === 0 || mech.rows[0].is_mechanic !== true) {
+      return res.status(403).json({ error: "You are not a certified Mechanic." });
+    }
+    const mxp = mech.rows[0].mechanic_xp || 0;
+    const rate = ceRepairRate(mxp);
+
+    const reg = await pool.query(
+      `SELECT owner_uuid, business_name, structure_code FROM ce_registers WHERE register_code=$1 AND community_org=$2`,
+      [register_code, community_org]);
+    if (reg.rows.length === 0) return res.status(404).json({ error: "Register not found" });
+    const r = reg.rows[0];
+    if (!r.structure_code) return res.json({ repaired: false, reason: "This building has no damage on record." });
+
+    const st = await pool.query(`SELECT hp, max_hp, repairing_by FROM ce_structures WHERE structure_code=$1`, [r.structure_code]);
+    if (st.rows.length === 0) return res.json({ repaired: false, reason: "No structure to repair." });
+    const hp = st.rows[0].hp;
+    const maxhp = st.rows[0].max_hp;
+    if (hp >= maxhp) return res.json({ repaired: false, reason: "Building is already at full HP." });
+    if (st.rows[0].repairing_by && st.rows[0].repairing_by !== mechanic_uuid) {
+      return res.json({ repaired: false, reason: "Another mechanic is already repairing this building." });
+    }
+
+    // set the repair job — cron will climb HP over time and pay on completion
+    await pool.query(
+      `UPDATE ce_structures SET repair_rate=$2, repairing_by=$3, repairing_name=$4, repair_started=NOW(), status='repairing' WHERE structure_code=$1`,
+      [r.structure_code, rate, mechanic_uuid, mechanic_name || "Mechanic"]);
+
+    const missing = maxhp - hp;
+    const ticks = Math.ceil(missing / rate);
+    const etaMin = ticks * 5;   // 5 min per tick
+    res.json({
+      repaired: true, started: true, business_name: r.business_name,
+      current_hp: hp, max_hp: maxhp, rate: rate, eta_minutes: etaMin,
+      message: "Repair underway — the building will restore over ~" + etaMin + " min."
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+app.post("/ce/launder", async (req, res) => {
+  const { avatar_uuid, community_org, front_code, amount } = req.body;
+  let amt = parseInt(amount, 10);
+  if (!avatar_uuid || !community_org || !front_code) return res.status(400).json({ error: "Missing avatar_uuid, org, or front_code" });
+  if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: "Invalid amount" });
+  try {
+    // launderer must be a criminal with enough dirty cash
+    const me = await pool.query(
+      `SELECT player_type, cash_on_hand FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`,
+      [avatar_uuid, community_org]);
+    if (me.rows.length === 0) return res.status(404).json({ error: "Player not found" });
+    if (me.rows[0].player_type !== "criminal") {
+      return res.status(403).json({ error: "Only criminals can launder money. Find a criminal with a front." });
+    }
+    const dirty = me.rows[0].cash_on_hand || 0;
+    if (dirty < amt) return res.json({ laundered: false, reason: "Not enough dirty cash.", have: dirty });
+
+    // front must exist and be flagged
+    const fr = await pool.query(
+      `SELECT owner_uuid, owner_name, business_name, is_front, front_cut_pct, laundered_total FROM ce_registers WHERE register_code=$1 AND community_org=$2`,
+      [front_code, community_org]);
+    if (fr.rows.length === 0) return res.status(404).json({ error: "Front not found" });
+    if (fr.rows[0].is_front !== true) return res.json({ laundered: false, reason: "That business is not set up as a front." });
+
+    const cutPct = fr.rows[0].front_cut_pct || 20;
+    const frontCut = Math.floor(amt * (cutPct / 100));
+    const treasuryCut = Math.floor(amt * CE_LAUNDER_TREASURY_PCT);
+    const clean = amt - frontCut - treasuryCut;
+
+    // move dirty -> clean for launderer, pay front owner, skim treasury
+    await pool.query(
+      `UPDATE ce_criminals SET cash_on_hand = GREATEST(cash_on_hand - $3, 0), bank_balance = bank_balance + $4 WHERE avatar_uuid=$1 AND community_org=$2`,
+      [avatar_uuid, community_org, amt, clean]);
+    await pool.query(
+      `UPDATE ce_criminals SET bank_balance = bank_balance + $3 WHERE avatar_uuid=$1 AND community_org=$2`,
+      [fr.rows[0].owner_uuid, community_org, frontCut]);
+    await pool.query(`UPDATE ce_city SET treasury = treasury + $1 WHERE community_org=$2`, [treasuryCut, community_org]);
+    await pool.query(`UPDATE ce_registers SET laundered_total = COALESCE(laundered_total,0) + $2 WHERE register_code=$1`, [front_code, amt]);
+
+    res.json({
+      laundered: true, front: fr.rows[0].business_name,
+      dirty_washed: amt, clean_received: clean,
+      front_cut: frontCut, treasury_cut: treasuryCut, front_cut_pct: cutPct
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Flag/unflag a register as a laundering front (owner only, criminal only)
+app.post("/ce/front/set", async (req, res) => {
+  const { avatar_uuid, community_org, register_code, on } = req.body;
+  if (!avatar_uuid || !community_org || !register_code) return res.status(400).json({ error: "Missing params" });
+  try {
+    const me = await pool.query(`SELECT player_type FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2`, [avatar_uuid, community_org]);
+    if (me.rows.length === 0 || me.rows[0].player_type !== "criminal") {
+      return res.status(403).json({ error: "Only criminals can run fronts." });
+    }
+    const reg = await pool.query(`SELECT owner_uuid FROM ce_registers WHERE register_code=$1 AND community_org=$2`, [register_code, community_org]);
+    if (reg.rows.length === 0) return res.status(404).json({ error: "Register not found" });
+    if (reg.rows[0].owner_uuid !== avatar_uuid) return res.status(403).json({ error: "You do not own this business." });
+    const flag = (on === true || on === "true");
+    await pool.query(`UPDATE ce_registers SET is_front=$2 WHERE register_code=$1`, [register_code, flag]);
+    res.json({ success: true, register_code: register_code, is_front: flag });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// ============================================================
+// CE SIEGE — declaration, presence, forfeiture
+// ============================================================
+var SIEGE_MIN_ATTACKERS = 2;        // 2-3 crew online + present to siege
+var SIEGE_ONLINE_WINDOW_MIN = 10;   // "online" = active within last N min
+var SIEGE_FORFEIT_DAYS = 3;
+var SIEGE_BREAK_HP_PCT = 30;        // repair above this % breaks the siege
+
+// heartbeat — HUD calls this so we know who's online (for presence checks)
+app.post("/ce/presence", async (req, res) => {
+  const { avatar_uuid, community_org } = req.body;
+  if (!avatar_uuid || !community_org) return res.status(400).json({ error: "Missing params" });
+  try {
+    await pool.query("UPDATE ce_criminals SET last_online=NOW() WHERE avatar_uuid=$1 AND community_org=$2", [avatar_uuid, community_org]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// declare a siege on a building
+app.post("/ce/siege/declare", async (req, res) => {
+  const { register_code, community_org, declarer_uuid } = req.body;
+  if (!register_code || !community_org || !declarer_uuid) return res.status(400).json({ error: "Missing params" });
+  try {
+    // declarer must be in a crew (member or leader)
+    let dc = await pool.query("SELECT crew_id FROM ce_crew_members WHERE avatar_uuid=$1 LIMIT 1", [declarer_uuid]);
+    let attCrew = null;
+    if (dc.rows.length > 0 && dc.rows[0].crew_id) attCrew = dc.rows[0].crew_id;
+    if (!attCrew) {
+      const dl = await pool.query("SELECT id FROM ce_crews WHERE leader_uuid=$1 AND community_org=$2 LIMIT 1", [declarer_uuid, community_org]);
+      if (dl.rows.length > 0) attCrew = dl.rows[0].id;
+    }
+    if (!attCrew) return res.status(403).json({ error: "You must be in a crew to declare a siege." });
+
+    // declarer must be a CRIMINAL, level 20+, and the crew LEADER
+    const decl = await pool.query("SELECT player_type, level FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2", [declarer_uuid, community_org]);
+    if (decl.rows.length === 0 || decl.rows[0].player_type !== "criminal") {
+      return res.status(403).json({ error: "Only criminals can declare a siege." });
+    }
+    if ((decl.rows[0].level || 1) < 20) {
+      return res.json({ declared: false, reason: "You must be level 20+ to declare a siege. (You are " + (decl.rows[0].level || 1) + ".)" });
+    }
+    const isLeader = await pool.query("SELECT id FROM ce_crews WHERE id=$1 AND leader_uuid=$2", [attCrew, declarer_uuid]);
+    if (isLeader.rows.length === 0) {
+      return res.json({ declared: false, reason: "Only the crew leader can declare a siege." });
+    }
+
+    const crewRow = await pool.query("SELECT crew_name FROM ce_crews WHERE id=$1", [attCrew]);
+    const attCrewName = crewRow.rows.length > 0 ? crewRow.rows[0].crew_name : "Unknown Crew";
+
+    // building must exist + not be self-owned by the attacking crew
+    const reg = await pool.query("SELECT owner_uuid, crew_id, business_name, structure_code FROM ce_registers WHERE register_code=$1 AND community_org=$2", [register_code, community_org]);
+    if (reg.rows.length === 0) return res.status(404).json({ error: "Building not found." });
+    const b = reg.rows[0];
+    if (b.crew_id && b.crew_id === attCrew) return res.json({ declared: false, reason: "You can't siege your own crew's building." });
+
+    // already under siege?
+    const existing = await pool.query("SELECT id FROM ce_sieges WHERE register_code=$1 AND status='active'", [register_code]);
+    if (existing.rows.length > 0) return res.json({ declared: false, reason: "This building is already under siege." });
+
+    // siege-immune window (post-takeover protection)?
+    if (b.structure_code) {
+      const imm = await pool.query("SELECT siege_immune_until FROM ce_structures WHERE structure_code=$1", [b.structure_code]);
+      if (imm.rows.length > 0 && imm.rows[0].siege_immune_until && new Date(imm.rows[0].siege_immune_until) > new Date()) {
+        return res.json({ declared: false, reason: "This building is under post-takeover protection and can't be sieged yet." });
+      }
+    }
+
+    // require SIEGE_MIN_ATTACKERS crew online (last_online within window)
+    const online = await pool.query(
+      "SELECT COUNT(*) AS n FROM ce_crew_members m JOIN ce_criminals c ON m.avatar_uuid=c.avatar_uuid WHERE m.crew_id=$1 AND c.player_type='criminal' AND c.last_online > NOW() - ($2 || ' minutes')::interval",
+      [attCrew, String(SIEGE_ONLINE_WINDOW_MIN)]);
+    // include leader in the count
+    const leaderOnline = await pool.query(
+      "SELECT COUNT(*) AS n FROM ce_crews cr JOIN ce_criminals c ON cr.leader_uuid=c.avatar_uuid WHERE cr.id=$1 AND c.last_online > NOW() - ($2 || ' minutes')::interval",
+      [attCrew, String(SIEGE_ONLINE_WINDOW_MIN)]);
+    const onlineCount = parseInt(online.rows[0].n) + parseInt(leaderOnline.rows[0].n);
+    if (onlineCount < SIEGE_MIN_ATTACKERS) {
+      return res.json({ declared: false, reason: "Need at least " + SIEGE_MIN_ATTACKERS + " crew online to declare a siege. Only " + onlineCount + " online." });
+    }
+
+    // defending crew online check (for the "fair chance" flag)
+    let defenderOnline = false;
+    if (b.crew_id) {
+      const defOn = await pool.query(
+        "SELECT COUNT(*) AS n FROM ce_crew_members m JOIN ce_criminals c ON m.avatar_uuid=c.avatar_uuid WHERE m.crew_id=$1 AND c.player_type='criminal' AND c.last_online > NOW() - ($2 || ' minutes')::interval",
+        [b.crew_id, String(SIEGE_ONLINE_WINDOW_MIN)]);
+      if (parseInt(defOn.rows[0].n) > 0) defenderOnline = true;
+    }
+    // also check the owner directly
+    const ownOn = await pool.query("SELECT last_online FROM ce_criminals WHERE avatar_uuid=$1", [b.owner_uuid]);
+    if (ownOn.rows.length > 0 && ownOn.rows[0].last_online && new Date(ownOn.rows[0].last_online) > new Date(Date.now() - SIEGE_ONLINE_WINDOW_MIN*60000)) {
+      defenderOnline = true;
+    }
+
+    // defender must have presence to activate — no sieging an empty house
+    if (!defenderOnline) {
+      return res.json({ declared: false, reason: "The defender is offline. You can damage the building (capped at 50%), but a siege only activates when they have someone online to defend." });
+    }
+
+    // create the siege
+    await pool.query(
+      "INSERT INTO ce_sieges (register_code, structure_code, community_org, attacking_crew_id, attacking_crew_name, defending_crew_id, defender_owner_uuid, status, defender_had_online, last_attacker_seen) VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,NOW())",
+      [register_code, b.structure_code, community_org, attCrew, attCrewName, b.crew_id || null, b.owner_uuid, defenderOnline]);
+
+    res.json({
+      declared: true, business_name: b.business_name,
+      attacking_crew: attCrewName, defender_online: defenderOnline,
+      message: "SIEGE DECLARED on " + b.business_name + " by " + attCrewName + "! Beat it to 0 HP and hold for " + SIEGE_FORFEIT_DAYS + " days to take it."
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// siege status for a building
+app.get("/ce/siege/status", async (req, res) => {
+  const { code, org } = req.query;
+  if (!code || !org) return res.status(400).json({ error: "Missing code or org" });
+  try {
+    const s = await pool.query("SELECT * FROM ce_sieges WHERE register_code=$1 AND status='active' ORDER BY declared_at DESC LIMIT 1", [code]);
+    if (s.rows.length === 0) return res.json({ under_siege: false });
+    const row = s.rows[0];
+    res.json({
+      under_siege: true, attacking_crew: row.attacking_crew_name,
+      declared_at: row.declared_at, forfeiture_deadline: row.forfeiture_deadline,
+      hit_zero_at: row.hit_zero_at, defender_had_online: row.defender_had_online
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 app.listen(3000, () => console.log('RDS API running on port 3000'));
 
