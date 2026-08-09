@@ -3960,6 +3960,76 @@ app.get("/ce/siege/status", async (req, res) => {
 });
 
 
+// ============================================================
+// CE PICKPOCKET — steal cash-on-hand from a nearby avatar
+
+// === CE PICKPOCKET (capped street crime) ===
+app.post("/ce/pickpocket", async (req, res) => {
+  const { thief_uuid, thief_name, target_uuid, target_name, community_org } = req.body;
+  if (!thief_uuid || !target_uuid || !community_org) return res.status(400).json({ error: "Missing params" });
+  if (thief_uuid === target_uuid) return res.json({ success: false, reason: "You can't pickpocket yourself." });
+  try {
+    const thief = await pool.query("SELECT player_type, level FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2", [thief_uuid, community_org]);
+    if (thief.rows.length === 0 || thief.rows[0].player_type !== "criminal") {
+      return res.status(403).json({ error: "Only criminals can pickpocket." });
+    }
+    const thiefLevel = thief.rows[0].level || 1;
+
+    const dayR = await pool.query("SELECT hits, earned, last_attempt FROM ce_pickpocket_daily WHERE thief_uuid=$1 AND day_stamp=CURRENT_DATE", [thief_uuid]);
+    let hitsToday = 0, earnedToday = 0, lastAttempt = null;
+    if (dayR.rows.length > 0) { hitsToday = dayR.rows[0].hits; earnedToday = dayR.rows[0].earned; lastAttempt = dayR.rows[0].last_attempt; }
+
+    if (lastAttempt && (Date.now() - new Date(lastAttempt).getTime()) < 120000) {
+      return res.json({ success: false, reason: "Slow down — wait a couple minutes before your next lift." });
+    }
+    if (hitsToday >= 10) return res.json({ success: false, reason: "You've pulled too many jobs today. Lay low till tomorrow." });
+    if (earnedToday >= 2000) return res.json({ success: false, reason: "You've made your take for the day. Come back tomorrow." });
+
+    const tl = await pool.query("SELECT last_attempt, hits_today, day_stamp FROM ce_pickpocket_log WHERE thief_uuid=$1 AND target_uuid=$2", [thief_uuid, target_uuid]);
+    let tgtHitsToday = 0;
+    if (tl.rows.length > 0) {
+      if (tl.rows[0].last_attempt && (Date.now() - new Date(tl.rows[0].last_attempt).getTime()) < 1800000) {
+        return res.json({ success: false, reason: "You already worked " + (target_name || "them") + " recently. Find another mark." });
+      }
+      if (tl.rows[0].day_stamp && new Date(tl.rows[0].day_stamp).toISOString().slice(0,10) === new Date().toISOString().slice(0,10)) {
+        tgtHitsToday = tl.rows[0].hits_today || 0;
+      }
+    }
+
+    const tgt = await pool.query("SELECT cash_on_hand FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2", [target_uuid, community_org]);
+    if (tgt.rows.length === 0) return res.json({ success: false, reason: "Target isn't in the game." });
+    const targetCash = tgt.rows[0].cash_on_hand || 0;
+    if (targetCash <= 0) return res.json({ success: false, reason: (target_name || "They") + " has empty pockets." });
+
+    const successChance = 50 + Math.min(thiefLevel, 35);
+    const caught = Math.floor(Math.random() * 100) >= successChance;
+
+    await pool.query("INSERT INTO ce_pickpocket_daily (thief_uuid, day_stamp, hits, earned, last_attempt) VALUES ($1,CURRENT_DATE,$2,$3,NOW()) ON CONFLICT (thief_uuid, day_stamp) DO UPDATE SET last_attempt=NOW()", [thief_uuid, hitsToday, earnedToday]);
+    await pool.query("INSERT INTO ce_pickpocket_log (thief_uuid, target_uuid, last_attempt, hits_today, day_stamp) VALUES ($1,$2,NOW(),$3,CURRENT_DATE) ON CONFLICT (thief_uuid, target_uuid) DO UPDATE SET last_attempt=NOW(), hits_today = CASE WHEN ce_pickpocket_log.day_stamp = CURRENT_DATE THEN ce_pickpocket_log.hits_today ELSE 0 END, day_stamp=CURRENT_DATE", [thief_uuid, target_uuid, tgtHitsToday]);
+
+    if (caught) {
+      await pool.query("UPDATE ce_criminals SET heat_level = COALESCE(heat_level,0) + 5 WHERE avatar_uuid=$1 AND community_org=$2", [thief_uuid, community_org]);
+      return res.json({ success: false, caught: true, target_uuid, target_name, reason: "You got made! " + (target_name || "They") + " felt your hand. Heat +5." });
+    }
+
+    let pct = 0.20;
+    if (tgtHitsToday === 1) pct = 0.10;
+    else if (tgtHitsToday >= 2) pct = 0.05;
+    let stolen = Math.floor(targetCash * pct);
+    if (stolen > 300) stolen = 300;
+    if (stolen > (2000 - earnedToday)) stolen = 2000 - earnedToday;
+    if (stolen < 1) stolen = 1;
+
+    await pool.query("UPDATE ce_criminals SET cash_on_hand = cash_on_hand - $1 WHERE avatar_uuid=$2 AND community_org=$3", [stolen, target_uuid, community_org]);
+    await pool.query("UPDATE ce_criminals SET cash_on_hand = cash_on_hand + $1, heat_level = COALESCE(heat_level,0) + 3, xp = COALESCE(xp,0) + 5 WHERE avatar_uuid=$2 AND community_org=$3", [stolen, thief_uuid, community_org]);
+    await pool.query("UPDATE ce_pickpocket_daily SET hits = hits + 1, earned = earned + $2 WHERE thief_uuid=$1 AND day_stamp=CURRENT_DATE", [thief_uuid, stolen]);
+    await pool.query("UPDATE ce_pickpocket_log SET hits_today = hits_today + 1 WHERE thief_uuid=$1 AND target_uuid=$2", [thief_uuid, target_uuid]);
+
+    res.json({ success: true, stolen, target_uuid, target_name, hits_today: hitsToday + 1, earned_today: earnedToday + stolen, message: "You lifted \u20a1" + stolen + " off " + (target_name || "them") + "! (" + (hitsToday+1) + "/10 today) Heat +3." });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 app.listen(3000, () => console.log('RDS API running on port 3000'));
 
 // ============================================================
