@@ -85,6 +85,16 @@ const pool = new Pool({
   port:     process.env.DB_PORT     || 5432
 });
 
+// === CE HEAT HELPER — add heat + track crime volume (call on every crime) ===
+async function ceAddHeat(uuid, org, amount) {
+  try {
+    await pool.query(
+      "UPDATE ce_criminals SET heat_level = heat_level + $3, crime_count = COALESCE(crime_count,0) + 1, last_crime_at = NOW() WHERE avatar_uuid=$1 AND community_org=$2",
+      [uuid, org, amount]);
+  } catch (e) {}
+}
+
+
 // ============================================================
 //  INCIDENTS — Hydrant knockdowns
 // ============================================================
@@ -4026,6 +4036,147 @@ app.post("/ce/pickpocket", async (req, res) => {
     await pool.query("UPDATE ce_pickpocket_log SET hits_today = hits_today + 1 WHERE thief_uuid=$1 AND target_uuid=$2", [thief_uuid, target_uuid]);
 
     res.json({ success: true, stolen, target_uuid, target_name, hits_today: hitsToday + 1, earned_today: earnedToday + stolen, message: "You lifted \u20a1" + stolen + " off " + (target_name || "them") + "! (" + (hitsToday+1) + "/10 today) Heat +3." });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// === CE POLICE — scan nearby avatars for wanted criminals ===
+var WANTED_THRESHOLD = 30;   // heat over this = wanted
+
+app.post("/ce/police/scan", async (req, res) => {
+  const { cop_uuid, community_org, nearby_uuids } = req.body;
+  if (!cop_uuid || !community_org || !Array.isArray(nearby_uuids)) {
+    return res.status(400).json({ error: "Missing cop_uuid, org, or nearby_uuids array" });
+  }
+  try {
+    // cop must be an on-duty police officer
+    const shift = await pool.query(
+      "SELECT job_type FROM ce_job_shifts WHERE avatar_uuid=$1 AND community_org=$2 AND status='active' AND job_type='police'",
+      [cop_uuid, community_org]);
+    if (shift.rows.length === 0) {
+      return res.json({ on_duty: false, wanted: [] });
+    }
+    if (nearby_uuids.length === 0) return res.json({ on_duty: true, wanted: [] });
+
+    // which of the nearby avatars are wanted (heat over threshold, not already jailed)?
+    const wanted = await pool.query(
+      "SELECT avatar_uuid, avatar_name, heat_level FROM ce_criminals WHERE community_org=$1 AND avatar_uuid = ANY($2) AND heat_level > $3 AND jailed = FALSE ORDER BY heat_level DESC",
+      [community_org, nearby_uuids, WANTED_THRESHOLD]);
+
+    res.json({
+      on_duty: true,
+      wanted: wanted.rows.map(function(r){ return { uuid: r.avatar_uuid, name: r.avatar_name, heat: r.heat_level }; })
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// quick check: is a single avatar wanted? (for arrest validation)
+app.get("/ce/police/wanted", async (req, res) => {
+  const { uuid, org } = req.query;
+  if (!uuid || !org) return res.status(400).json({ error: "Missing uuid or org" });
+  try {
+    const r = await pool.query("SELECT avatar_name, heat_level, jailed FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2", [uuid, org]);
+    if (r.rows.length === 0) return res.json({ found: false });
+    const h = r.rows[0].heat_level || 0;
+    res.json({ found: true, name: r.rows[0].avatar_name, heat: h, wanted: h > WANTED_THRESHOLD, jailed: r.rows[0].jailed });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// === CE ARREST / JAIL / RELEASE / HEAT-WIPE ===
+var JAIL_MINUTES = 15;        // auto-release after this even if no cop releases
+var ARREST_FINE_PCT = 0.50;   // fine = 50% of cash-on-hand (bank is safe)
+
+// cop arrests a wanted suspect
+app.post("/ce/police/arrest", async (req, res) => {
+  const { cop_uuid, suspect_uuid, community_org } = req.body;
+  if (!cop_uuid || !suspect_uuid || !community_org) return res.status(400).json({ error: "Missing params" });
+  if (cop_uuid === suspect_uuid) return res.json({ arrested: false, reason: "You can't arrest yourself." });
+  try {
+    // cop must be on-duty police
+    const shift = await pool.query("SELECT job_type FROM ce_job_shifts WHERE avatar_uuid=$1 AND community_org=$2 AND status='active' AND job_type='police'", [cop_uuid, community_org]);
+    if (shift.rows.length === 0) return res.status(403).json({ error: "You must be an on-duty officer to arrest." });
+
+    // suspect must be wanted + not already jailed
+    const sus = await pool.query("SELECT avatar_name, heat_level, jailed, cash_on_hand FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2", [suspect_uuid, community_org]);
+    if (sus.rows.length === 0) return res.json({ arrested: false, reason: "Suspect not found." });
+    const s = sus.rows[0];
+    if (s.jailed) return res.json({ arrested: false, reason: s.avatar_name + " is already in custody." });
+    if ((s.heat_level || 0) <= 30) return res.json({ arrested: false, reason: s.avatar_name + " isn't wanted (heat too low)." });
+
+    // fine = 50% of cash on hand; bank untouched
+    const fine = Math.floor((s.cash_on_hand || 0) * ARREST_FINE_PCT);
+
+    // jail them: clear heat + crime_count, take fine, confiscate tools, set jail timer
+    await pool.query(
+      "UPDATE ce_criminals SET jailed=TRUE, jail_until=NOW() + ($3 || ' minutes')::interval, heat_level=0, crime_count=0, cash_on_hand = GREATEST(0, cash_on_hand - $4) WHERE avatar_uuid=$1 AND community_org=$2",
+      [suspect_uuid, community_org, String(JAIL_MINUTES), fine]);
+
+    // credit the cop: arrest count + XP + a cut of the fine
+    const copCut = Math.floor(fine * 0.5);
+    await pool.query(
+      "UPDATE ce_criminals SET total_arrests = COALESCE(total_arrests,0) + 1, police_xp = COALESCE(police_xp,0) + 25, cash_on_hand = cash_on_hand + $3 WHERE avatar_uuid=$1 AND community_org=$2",
+      [cop_uuid, community_org, copCut]);
+
+    res.json({
+      arrested: true, suspect_name: s.avatar_name, fine: fine, cop_reward: copCut,
+      jail_minutes: JAIL_MINUTES,
+      message: "Arrested " + s.avatar_name + "! Fined \u20a1" + fine + ", jailed " + JAIL_MINUTES + " min. You earned \u20a1" + copCut + " + 25 XP."
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// cop releases a jailed suspect early
+app.post("/ce/police/release", async (req, res) => {
+  const { cop_uuid, suspect_uuid, community_org } = req.body;
+  if (!cop_uuid || !suspect_uuid || !community_org) return res.status(400).json({ error: "Missing params" });
+  try {
+    const shift = await pool.query("SELECT job_type FROM ce_job_shifts WHERE avatar_uuid=$1 AND community_org=$2 AND status='active' AND job_type='police'", [cop_uuid, community_org]);
+    if (shift.rows.length === 0) return res.status(403).json({ error: "You must be an on-duty officer to release." });
+    await pool.query("UPDATE ce_criminals SET jailed=FALSE, jail_until=NULL WHERE avatar_uuid=$1 AND community_org=$2", [suspect_uuid, community_org]);
+    res.json({ released: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// a criminal (or their HUD) checks jail status
+app.get("/ce/jail/status", async (req, res) => {
+  const { uuid, org } = req.query;
+  if (!uuid || !org) return res.status(400).json({ error: "Missing uuid or org" });
+  try {
+    const r = await pool.query("SELECT jailed, jail_until, heat_level FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2", [uuid, org]);
+    if (r.rows.length === 0) return res.json({ jailed: false });
+    let jailed = r.rows[0].jailed;
+    let until = r.rows[0].jail_until;
+    // auto-release if timer passed
+    if (jailed && until && new Date(until) < new Date()) {
+      await pool.query("UPDATE ce_criminals SET jailed=FALSE, jail_until=NULL WHERE avatar_uuid=$1 AND community_org=$2", [uuid, org]);
+      jailed = false; until = null;
+    }
+    let secsLeft = 0;
+    if (jailed && until) secsLeft = Math.max(0, Math.floor((new Date(until).getTime() - Date.now())/1000));
+    res.json({ jailed: jailed, seconds_left: secsLeft, heat: r.rows[0].heat_level });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// buy + use the weekly heat-wipe item
+app.post("/ce/heatwipe", async (req, res) => {
+  const { avatar_uuid, community_org } = req.body;
+  if (!avatar_uuid || !community_org) return res.status(400).json({ error: "Missing params" });
+  try {
+    const r = await pool.query("SELECT player_type, heat_level, last_wipe_purchase FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2", [avatar_uuid, community_org]);
+    if (r.rows.length === 0) return res.json({ wiped: false, reason: "Not found." });
+    if (r.rows[0].player_type !== "criminal") return res.status(403).json({ error: "Only criminals can use this." });
+
+    // one per week
+    const last = r.rows[0].last_wipe_purchase;
+    if (last && (Date.now() - new Date(last).getTime()) < 7*24*60*60*1000) {
+      const daysLeft = Math.ceil((7*24*60*60*1000 - (Date.now() - new Date(last).getTime())) / (24*60*60*1000));
+      return res.json({ wiped: false, reason: "You already used your weekly heat-wipe. " + daysLeft + " day(s) until you can buy another." });
+    }
+
+    // wipe heat + crime_count, stamp the weekly purchase
+    await pool.query("UPDATE ce_criminals SET heat_level=0, crime_count=0, last_wipe_purchase=NOW() WHERE avatar_uuid=$1 AND community_org=$2", [avatar_uuid, community_org]);
+    res.json({ wiped: true, message: "Heat wiped clean. Your record is quiet... for now." });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
