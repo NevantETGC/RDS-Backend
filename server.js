@@ -124,6 +124,20 @@ async function ceLogCrimeRaw(uuid, name, org, crimeType, detail, amount, isAnon)
   } catch (e) { console.error("ceLogCrimeRaw error:", e.message); }
 }
 
+// === CE ENSURE STRUCTURE — auto-create a structure row for a register + link them ===
+async function ceEnsureStructure(regCode, bizName, ownerUuid, ownerName, org, region) {
+  try {
+    await pool.query(
+      "INSERT INTO ce_structures (structure_code, structure_name, structure_type, owner_uuid, owner_name, community_org, region, hp, max_hp, status, tier) VALUES ($1,$2,$3,$4,$5,$6,$7,100,100,$8,1) ON CONFLICT (structure_code) DO UPDATE SET structure_name=$2, owner_uuid=$4, owner_name=$5",
+      [regCode, bizName || "Business", "business", ownerUuid, ownerName || "", org, region || "", "operational"]);
+    // link the register to its structure
+    await pool.query(
+      "UPDATE ce_registers SET structure_code=$1 WHERE register_code=$1",
+      [regCode]);
+  } catch (e) { console.error("ceEnsureStructure error:", e.message); }
+}
+
+
 
 
 
@@ -2571,6 +2585,7 @@ app.post("/ce/till/register", async (req, res) => {
         [register_code, business_name || "Business", owner_name || "", region || "",
          stats.fill_rate, stats.max_balance, stats.min_rob_level]
       );
+      await ceEnsureStructure(register_code, business_name, owner_uuid, owner_name, community_org, region);
       return res.json({ success: true, register_code, licensed: true, level: lvl,
         max_balance: stats.max_balance, fill_rate: stats.fill_rate, min_rob_level: stats.min_rob_level });
     }
@@ -2592,6 +2607,7 @@ app.post("/ce/till/register", async (req, res) => {
       [register_code, business_name || "Business", owner_uuid, owner_name || "", community_org, region || "",
        stats.fill_rate, stats.max_balance, stats.min_rob_level, stats.license_fee]
     );
+    await ceEnsureStructure(register_code, business_name, owner_uuid, owner_name, community_org, region);
     res.json({ success: true, register_code, licensed: true, level: lvl,
       fee_charged: stats.license_fee, remaining_bank: bank - stats.license_fee,
       max_balance: stats.max_balance, fill_rate: stats.fill_rate, min_rob_level: stats.min_rob_level });
