@@ -94,6 +94,38 @@ async function ceAddHeat(uuid, org, amount) {
   } catch (e) {}
 }
 
+// === CE CRIME LOG HELPER — records a crime; mask makes it anonymous (off rap sheet) ===
+// Returns true if the crime was logged ANONYMOUSLY (mask burned), false if logged under their name.
+async function ceLogCrime(uuid, name, org, crimeType, detail, amount) {
+  let anon = false;
+  try {
+    const m = await pool.query(
+      "SELECT mask_uses FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2",
+      [uuid, org]);
+    if (m.rows.length > 0 && (m.rows[0].mask_uses || 0) > 0) {
+      anon = true;
+      await pool.query(
+        "UPDATE ce_criminals SET mask_uses = mask_uses - 1 WHERE avatar_uuid=$1 AND community_org=$2",
+        [uuid, org]);
+    }
+    await pool.query(
+      "INSERT INTO ce_crime_log (perp_uuid, perp_name, community_org, crime_type, detail, amount, anonymous) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      [uuid, (anon ? "Unknown" : name), org, crimeType, detail || null, amount || 0, anon]);
+  } catch (e) { console.error("ceLogCrime error:", e.message); }
+  return anon;
+}
+
+// === CE CRIME LOG (RAW) — log without consuming a mask; caller already knows anon state ===
+async function ceLogCrimeRaw(uuid, name, org, crimeType, detail, amount, isAnon) {
+  try {
+    await pool.query(
+      "INSERT INTO ce_crime_log (perp_uuid, perp_name, community_org, crime_type, detail, amount, anonymous) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      [uuid, (isAnon ? "Unknown" : name), org, crimeType, detail || null, amount || 0, isAnon ? true : false]);
+  } catch (e) { console.error("ceLogCrimeRaw error:", e.message); }
+}
+
+
+
 
 // ============================================================
 //  INCIDENTS — Hydrant knockdowns
@@ -2178,11 +2210,12 @@ app.post('/ce/item/steal', async (req, res) => {
     );
     // Increment criminal stats
     await pool.query(
-      `UPDATE ce_criminals SET total_steals=total_steals+1, heat_level=LEAST(10, heat_level+2), last_active=NOW()
+      `UPDATE ce_criminals SET total_steals=total_steals+1, heat_level=LEAST(100, heat_level+8), last_active=NOW()
        WHERE avatar_uuid=$1 AND community_org=$2`,
       [criminal_uuid, community_org]
     );
     const xpInfo = await ceAddXp(criminal_uuid, community_org, 10);
+    await ceLogCrimeRaw(criminal_uuid, criminal_name, community_org, "theft", check.rows[0].item_name, check.rows[0].base_value, usedMask);
     res.json({ success: true, item: check.rows[0].item_name, value: check.rows[0].base_value, used_gloves: usedGloves, used_mask: usedMask, level: xpInfo ? xpInfo.level : thiefLevel, leveled_up: xpInfo ? xpInfo.leveled_up : false, rank: xpInfo ? xpInfo.rank : "" });
   } catch (err) {
     console.error('CE steal error:', err);
@@ -2475,7 +2508,7 @@ app.post("/ce/bank/rob", async (req, res) => {
     }
     const payout = 1000 + Math.floor(Math.random() * 1500);
     await pool.query(
-      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand+$1, heat_level=LEAST(10, heat_level+5),
+      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand+$1, heat_level=LEAST(100, heat_level+25),
        last_bank_rob=NOW(), last_active=NOW() WHERE avatar_uuid=$2 AND community_org=$3`,
       [payout, avatar_uuid, community_org]
     );
@@ -2486,6 +2519,7 @@ app.post("/ce/bank/rob", async (req, res) => {
     );
     const xpInfo = await ceAddXp(avatar_uuid, community_org, 250);
     await ceCrewCut(avatar_uuid, community_org, payout);
+    await ceLogCrime(avatar_uuid, avatar_name, community_org, "bank_robbery", "City Bank", payout);
     res.json({ success: true, payout: payout, heat_added: 5, level: xpInfo ? xpInfo.level : 0, leveled_up: xpInfo ? xpInfo.leveled_up : false, rank: xpInfo ? xpInfo.rank : "" });
   } catch (err) {
     console.error("CE bank rob error:", err);
@@ -2730,7 +2764,7 @@ app.post("/ce/till/rob", async (req, res) => {
 
     await pool.query(`UPDATE ce_registers SET balance=0, last_robbed=NOW() WHERE register_code=$1`, [register_code]);
     await pool.query(
-      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand+$1, heat_level=LEAST(10, heat_level+$2), last_active=NOW()
+      `UPDATE ce_criminals SET cash_on_hand=cash_on_hand+$1, heat_level=LEAST(100, heat_level+$2), last_active=NOW()
        WHERE avatar_uuid=$3 AND community_org=$4`,
       [payout, heat, criminal_uuid, community_org]
     );
@@ -2748,6 +2782,7 @@ app.post("/ce/till/rob", async (req, res) => {
        !usedGloves, !usedMask, !usedJammer]
     );
     await ceCrewCut(criminal_uuid, community_org, payout);
+    await ceLogCrimeRaw(criminal_uuid, criminal_name, community_org, "store_robbery", t.rows[0].business_name, payout, usedMask);
     res.json({
       success: true, payout: payout, heat_added: heat,
       used_gloves: usedGloves, used_mask: usedMask, used_lockpick: usedPick, used_jammer: usedJammer,
@@ -3269,7 +3304,7 @@ app.get("/ce/hud/screen", async (req, res) => {
            + "   LVL   " + lvl + " / 100\n"
            + "   XP    " + ceComma(c.xp) + " / " + ceComma(nextXp) + "\n\n"
            + "   STEALS " + (c.total_steals||0) + "   FENCED " + (c.total_fenced||0) + "\n"
-           + "   HEAT   " + (c.heat_level||0) + " / 10\n\n"
+           + "   HEAT   " + (c.heat_level||0) + " / 100\n\n"
            + BOT;
     }
     else if (appName === "stash") {
@@ -4034,6 +4069,7 @@ app.post("/ce/pickpocket", async (req, res) => {
     await pool.query("UPDATE ce_criminals SET cash_on_hand = cash_on_hand + $1, heat_level = COALESCE(heat_level,0) + 3, xp = COALESCE(xp,0) + 5 WHERE avatar_uuid=$2 AND community_org=$3", [stolen, thief_uuid, community_org]);
     await pool.query("UPDATE ce_pickpocket_daily SET hits = hits + 1, earned = earned + $2 WHERE thief_uuid=$1 AND day_stamp=CURRENT_DATE", [thief_uuid, stolen]);
     await pool.query("UPDATE ce_pickpocket_log SET hits_today = hits_today + 1 WHERE thief_uuid=$1 AND target_uuid=$2", [thief_uuid, target_uuid]);
+    await ceLogCrime(thief_uuid, thief_name, community_org, "pickpocket", (target_name || "a victim"), stolen);
 
     res.json({ success: true, stolen, target_uuid, target_name, hits_today: hitsToday + 1, earned_today: earnedToday + stolen, message: "You lifted \u20a1" + stolen + " off " + (target_name || "them") + "! (" + (hitsToday+1) + "/10 today) Heat +3." });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4177,6 +4213,56 @@ app.post("/ce/heatwipe", async (req, res) => {
     // wipe heat + crime_count, stamp the weekly purchase
     await pool.query("UPDATE ce_criminals SET heat_level=0, crime_count=0, last_wipe_purchase=NOW() WHERE avatar_uuid=$1 AND community_org=$2", [avatar_uuid, community_org]);
     res.json({ wiped: true, message: "Heat wiped clean. Your record is quiet... for now." });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// === CE RAP SHEET — cop pulls a suspect's traceable crime record ===
+// Only NON-anonymous crimes show (masked crimes are ghosts). On-duty police only.
+app.get("/ce/police/record", async (req, res) => {
+  const { suspect, cop, org } = req.query;
+  if (!suspect || !cop || !org) return res.status(400).json({ error: "Missing suspect, cop, or org" });
+  try {
+    // cop must be on-duty police
+    const shift = await pool.query(
+      "SELECT job_type FROM ce_job_shifts WHERE avatar_uuid=$1 AND community_org=$2 AND status='active' AND job_type='police'",
+      [cop, org]);
+    if (shift.rows.length === 0) return res.status(403).json({ error: "You must be an on-duty officer to run records." });
+
+    // suspect basic info
+    const sus = await pool.query(
+      "SELECT avatar_name, heat_level, total_arrests, jailed FROM ce_criminals WHERE avatar_uuid=$1 AND community_org=$2",
+      [suspect, org]);
+    if (sus.rows.length === 0) return res.json({ found: false });
+    const info = sus.rows[0];
+
+    // pull traceable (non-anonymous) crimes, most recent first, cap 15
+    const crimes = await pool.query(
+      "SELECT crime_type, detail, amount, created_at FROM ce_crime_log WHERE perp_uuid=$1 AND community_org=$2 AND anonymous=FALSE ORDER BY created_at DESC LIMIT 15",
+      [suspect, org]);
+
+    // count totals
+    const counts = await pool.query(
+      "SELECT COUNT(*) FILTER (WHERE anonymous=FALSE) AS on_record, COUNT(*) FILTER (WHERE anonymous=TRUE) AS anonymous_ct FROM ce_crime_log WHERE perp_uuid=$1 AND community_org=$2",
+      [suspect, org]);
+
+    const onRecord = parseInt(counts.rows[0].on_record) || 0;
+    const anonCt = parseInt(counts.rows[0].anonymous_ct) || 0;
+
+    res.json({
+      found: true,
+      suspect_name: info.avatar_name,
+      heat: info.heat_level,
+      prior_arrests: info.total_arrests,
+      jailed: info.jailed,
+      wanted: info.heat_level > 30,
+      on_record_count: onRecord,
+      anonymous_count: anonCt,
+      has_record: onRecord > 0,
+      crimes: crimes.rows.map(function(r){
+        return { type: r.crime_type, detail: r.detail, amount: r.amount, when: r.created_at };
+      })
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
