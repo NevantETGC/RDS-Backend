@@ -4306,6 +4306,8 @@ app.get("/ce/structure/pair", async (req, res) => {
 
 require("./ce_admin")(app, pool);
 
+require("./ce_police")(app, pool);
+
 app.listen(3000, () => console.log('RDS API running on port 3000'));
 
 // ============================================================
