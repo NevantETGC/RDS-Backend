@@ -4283,6 +4283,29 @@ app.get("/ce/police/record", async (req, res) => {
 });
 
 
+
+// === STRUCTURE PAIRING — object sends owner_uuid, gets back its register code ===
+// Panel/sensor call this on startup instead of hand-copying codes.
+app.get("/ce/structure/pair", async (req, res) => {
+  const { owner_uuid, community_org } = req.query;
+  if (!owner_uuid || !community_org) return res.status(400).json({ error: "Missing owner_uuid or org" });
+  try {
+    // return the owner most-recent register (one owner = one shop in the normal case)
+    const r = await pool.query(
+      "SELECT register_code, business_name, structure_code FROM ce_registers WHERE owner_uuid=$1 AND community_org=$2 ORDER BY register_code DESC LIMIT 1",
+      [owner_uuid, community_org]);
+    if (r.rows.length === 0) return res.json({ paired: false, reason: "No register found for this owner." });
+    res.json({
+      paired: true,
+      register_code: r.rows[0].register_code,
+      business_name: r.rows[0].business_name,
+      structure_code: r.rows[0].structure_code || r.rows[0].register_code
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+require("./ce_admin")(app, pool);
+
 app.listen(3000, () => console.log('RDS API running on port 3000'));
 
 // ============================================================
