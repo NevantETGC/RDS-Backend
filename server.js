@@ -2935,7 +2935,7 @@ app.post("/ce/crew/create", async (req, res) => {
       [crew_name || "Unnamed Crew", community_org, leader_uuid, leader_name || "", safe_code]);
     const crewId = c.rows[0].id;
     await pool.query(
-      `INSERT INTO ce_crew_members (crew_id, avatar_uuid, avatar_name, crew_rank)
+      `INSERT INTO ce_crew_members (crew_id, avatar_uuid, avatar_name, rank)
        VALUES ($1,$2,$3,'Boss') ON CONFLICT DO NOTHING`,
       [crewId, leader_uuid, leader_name || ""]);
     await pool.query(`UPDATE ce_criminals SET crew_id=$1 WHERE avatar_uuid=$2 AND community_org=$3`, [crewId, leader_uuid, community_org]);
@@ -2961,8 +2961,8 @@ app.post("/ce/crew/join", async (req, res) => {
        VALUES ($1,$2,$3) ON CONFLICT (avatar_uuid, community_org) DO UPDATE SET avatar_name=$2`,
       [avatar_uuid, avatar_name || "Recruit", community_org]);
     await pool.query(
-      `INSERT INTO ce_crew_members (crew_id, avatar_uuid, avatar_name, crew_rank)
-       VALUES ($1,$2,$3,'Soldier')`, [crewId, avatar_uuid, avatar_name || "Recruit"]);
+      `INSERT INTO ce_crew_members (crew_id, avatar_uuid, avatar_name, rank)
+       VALUES ($1,$2,$3,'member')`, [crewId, avatar_uuid, avatar_name || "Recruit"]);
     await pool.query(`UPDATE ce_criminals SET crew_id=$1 WHERE avatar_uuid=$2 AND community_org=$3`, [crewId, avatar_uuid, community_org]);
     res.json({ success: true, crew_name: c.rows[0].crew_name });
   } catch (err) {
@@ -2977,9 +2977,9 @@ app.post("/ce/crew/leave", async (req, res) => {
   if (!avatar_uuid || !community_org) return res.status(400).json({ error: "Missing fields" });
   try {
     const m = await pool.query(
-      `SELECT cm.crew_id, cm.crew_rank FROM ce_crew_members cm WHERE cm.avatar_uuid=$1`, [avatar_uuid]);
+      `SELECT cm.crew_id, cm.rank FROM ce_crew_members cm WHERE cm.avatar_uuid=$1`, [avatar_uuid]);
     if (m.rows.length === 0) return res.status(404).json({ error: "You are not in a crew" });
-    if (m.rows[0].crew_rank === "Boss") return res.status(403).json({ error: "The boss cannot leave. Disband instead." });
+    if (m.rows[0].rank === "Boss") return res.status(403).json({ error: "The boss cannot leave. Disband instead." });
     await pool.query(`DELETE FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
     await pool.query(`UPDATE ce_criminals SET crew_id=NULL WHERE avatar_uuid=$1 AND community_org=$2`, [avatar_uuid, community_org]);
     res.json({ success: true });
@@ -3004,7 +3004,7 @@ app.get("/ce/crew/status", async (req, res) => {
     if (crew.rows.length === 0) return res.status(404).json({ error: "No crew found" });
     const cr = crew.rows[0];
     const members = await pool.query(
-      `SELECT avatar_name, crew_rank FROM ce_crew_members WHERE crew_id=$1 ORDER BY joined_at ASC`, [cr.id]);
+      `SELECT avatar_name, rank FROM ce_crew_members WHERE crew_id=$1 ORDER BY joined_at ASC`, [cr.id]);
     res.json({
       crew_name: cr.crew_name, crew_id: cr.id, leader_name: cr.leader_name,
       vault_balance: cr.vault_balance, cut_pct: cr.cut_pct, total_earned: cr.total_earned,
@@ -3042,9 +3042,9 @@ app.post("/ce/crew/withdraw", async (req, res) => {
   const amt = parseInt(amount);
   if (!avatar_uuid || !community_org || !amt || amt <= 0) return res.status(400).json({ error: "Invalid amount" });
   try {
-    const m = await pool.query(`SELECT crew_id, crew_rank FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    const m = await pool.query(`SELECT crew_id, rank FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
     if (m.rows.length === 0) return res.status(404).json({ error: "You are not in a crew" });
-    if (m.rows[0].crew_rank !== "Boss") return res.status(403).json({ error: "Only the boss can withdraw from the vault" });
+    if (m.rows[0].rank !== "Boss") return res.status(403).json({ error: "Only the boss can withdraw from the vault" });
     const r = await pool.query(
       `UPDATE ce_crews SET vault_balance=vault_balance-$1 WHERE id=$2 AND vault_balance>=$1 RETURNING vault_balance`,
       [amt, m.rows[0].crew_id]);
@@ -3106,8 +3106,8 @@ app.post("/ce/crew/setcut", async (req, res) => {
   const pct = parseInt(cut_pct);
   if (!avatar_uuid || isNaN(pct) || pct < 0 || pct > 50) return res.status(400).json({ error: "Cut must be 0-50%" });
   try {
-    const m = await pool.query(`SELECT crew_id, crew_rank FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
-    if (m.rows.length === 0 || m.rows[0].crew_rank !== "Boss") return res.status(403).json({ error: "Only the boss sets the cut" });
+    const m = await pool.query(`SELECT crew_id, rank FROM ce_crew_members WHERE avatar_uuid=$1`, [avatar_uuid]);
+    if (m.rows.length === 0 || m.rows[0].rank !== "Boss") return res.status(403).json({ error: "Only the boss sets the cut" });
     await pool.query(`UPDATE ce_crews SET cut_pct=$1 WHERE id=$2`, [pct, m.rows[0].crew_id]);
     res.json({ success: true, cut_pct: pct });
   } catch (err) {
